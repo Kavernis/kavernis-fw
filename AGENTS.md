@@ -1,4 +1,4 @@
-# CLAUDE.md — Kavernis FW Development Guidelines
+# AGENTS.md — Kavernis FW Development Guidelines
 
 This file defines the rules that AI-assisted development MUST follow when modifying Kavernis FW.
 

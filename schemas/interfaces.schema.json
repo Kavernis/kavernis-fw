@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kavernis.example/schemas/interfaces.schema.json",
+  "title": "Kavernis interfaces configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "interfaces"],
+  "properties": {
+    "version": {"const": 1},
+    "interfaces": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/interface"}
+    }
+  },
+  "$defs": {
+    "interface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uid", "id", "name", "device", "ipv4", "ipv6"],
+      "properties": {
+        "uid": {"type": "string", "format": "uuid"},
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "name": {"type": "string", "minLength": 1},
+        "device": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]+$"},
+        "ipv4": {"$ref": "#/$defs/ipv4"},
+        "ipv6": {"$ref": "#/$defs/ipv6"}
+      }
+    },
+    "ipv4": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["mode", "address"], "properties": {"mode": {"const": "static"}, "address": {"type": "string"}}},
+        {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"enum": ["dhcp", "disabled"]}}}
+      ]
+    },
+    "ipv6": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["mode", "address"], "properties": {"mode": {"const": "static"}, "address": {"type": "string"}}},
+        {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"enum": ["dhcp6", "slaac", "disabled"]}}}
+      ]
+    }
+  }
+}
