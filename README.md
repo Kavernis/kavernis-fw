@@ -206,7 +206,7 @@ Planned technologies include:
 | Network configuration | systemd-networkd |
 | Firewall / NAT        | nftables         |
 | DHCP                  | Kea DHCP         |
-| DNS                   | Unbound          |
+| DNS                   | Bind9         |
 | Advanced routing      | FRRouting        |
 | VPN                   | WireGuard        |
 | Backend / Core        | Python           |
