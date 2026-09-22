@@ -141,6 +141,79 @@ The YAML configuration represents the desired state.
 
 Generated files such as nftables rulesets or systemd-networkd configuration are implementation artifacts and are not the source of truth.
 
+### VLAN interfaces
+
+An interface can declare an optional `vlan` block. `parent` references the `id`
+of a physical interface in the same document, and `tag` is an integer from 1 to
+4094. The `(parent, tag)` pair must be unique. Nested VLANs are not supported.
+Existing interface declarations without a `vlan` block remain unchanged.
+
+```yaml
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000003"
+    id: guests
+    name: Guests VLAN
+    device: eth1.20
+    vlan:
+      parent: lan
+      tag: 20
+    ipv4:
+      mode: static
+      address: 192.168.20.1/24
+    ipv6:
+      mode: disabled
+```
+
+`device` explicitly names the VLAN interface (at most 15 characters); it does
+not need to follow the `parent.tag` naming convention. VLAN interfaces support
+the same IPv4 and IPv6 modes as physical interfaces. A parent can carry multiple
+VLANs and retain its own IP configuration, or use disabled IP modes for a trunk.
+
+See [the complete VLAN example](configs/examples/interfaces-vlan.yml).
+The backend generates a `.netdev` file per VLAN, a `.network` file per interface,
+and `VLAN=` attachments in the parent's `.network` file, using the native
+[systemd VLAN configuration](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
+Candidates are validated in memory; this milestone does not apply configuration
+to the host or perform native service validation.
+
+### Bridge interfaces
+
+A bridge joins physical or VLAN interfaces into one layer-2 network. Declare a
+separate interface with a `bridge` block, referencing member interface `id`s:
+
+```yaml
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000004"
+    id: lan-bridge
+    name: LAN bridge
+    device: br0
+    bridge:
+      members: [lan-one, lan-two]
+      stp: true
+    ipv4:
+      mode: static
+      address: 192.168.10.1/24
+    ipv6:
+      mode: disabled
+```
+
+Each member must be declared in the same document with both IP modes set to
+`disabled`. Configure addresses, DHCP or SLAAC on the bridge itself. Members
+have DHCP, IPv6 router advertisements and link-local addressing explicitly
+disabled in the generated files. The bridge device name follows the same rules
+as a VLAN device name.
+
+`members` must contain at least one unique interface id. A member can belong to
+only one bridge. Bridges cannot be nested or also declare a `vlan` block.
+VLAN interfaces can be members, but a physical interface used as a VLAN parent
+cannot also be a bridge member; attach its VLAN interfaces instead. VLANs on top
+of bridges and bridge VLAN filtering are not supported in this initial slice.
+
+`stp` defaults to `true` and can explicitly be set to `false`. The backend emits
+`Kind=bridge` and `STP=` in a `.netdev` file, with `Bridge=` attachments in each
+member's `.network` file, following the
+[systemd bridge configuration](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
+See [the complete bridge example](configs/examples/interfaces-bridge.yml).
+Generation and validation stay in memory without modifying the host network.
+
 ## Configuration Pipeline
 
 Configuration follows a strict processing pipeline:
@@ -206,7 +279,7 @@ Planned technologies include:
 | Network configuration | systemd-networkd |
 | Firewall / NAT        | nftables         |
 | DHCP                  | Kea DHCP         |
-| DNS                   | Unbound          |
+| DNS                   | Bind9         |
 | Advanced routing      | FRRouting        |
 | VPN                   | WireGuard        |
 | Backend / Core        | Python           |

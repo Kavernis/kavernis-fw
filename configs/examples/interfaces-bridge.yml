@@ -1,0 +1,33 @@
+version: 1
+
+interfaces:
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000001"
+    id: lan-one
+    name: LAN port 1
+    device: eth1
+    ipv4:
+      mode: disabled
+    ipv6:
+      mode: disabled
+
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000002"
+    id: lan-two
+    name: LAN port 2
+    device: eth2
+    ipv4:
+      mode: disabled
+    ipv6:
+      mode: disabled
+
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000003"
+    id: lan
+    name: LAN bridge
+    device: br0
+    bridge:
+      members: [lan-one, lan-two]
+      stp: true
+    ipv4:
+      mode: static
+      address: 192.168.10.1/24
+    ipv6:
+      mode: disabled

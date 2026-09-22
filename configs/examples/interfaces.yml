@@ -1,0 +1,25 @@
+version: 1
+
+interfaces:
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000001"
+    id: lan
+    name: LAN
+    device: eth0
+
+    ipv4:
+      mode: static
+      address: 192.168.0.1/24
+
+    ipv6:
+      mode: disabled
+
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000002"
+    id: wan
+    name: WAN
+    device: eth1
+
+    ipv4:
+      mode: dhcp
+
+    ipv6:
+      mode: dhcp6
