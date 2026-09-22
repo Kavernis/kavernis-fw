@@ -1,7 +1,10 @@
+import subprocess
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 from kavernis.backends.networkd import (
+    NetworkdApplyError,
     NetworkdConfiguration,
     NetworkdValidationError,
     generate,
@@ -115,3 +118,35 @@ def test_reject_incomplete_domain_model_before_generation() -> None:
 
     with pytest.raises(NetworkdValidationError, match="no address"):
         generate([interface])
+
+
+def test_apply_restores_managed_files_when_networkctl_reload_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from kavernis.backends import networkd
+
+    managed = tmp_path / "10-kavernis-old.network"
+    managed.write_text("old\n", encoding="utf-8")
+    unmanaged = tmp_path / "20-unmanaged.network"
+    unmanaged.write_text("keep\n", encoding="utf-8")
+
+    calls = []
+
+    def reload_fails(*args, **kwargs):
+        calls.append((args, kwargs))
+        if kwargs["check"]:
+            raise subprocess.CalledProcessError(1, args[0], stderr="invalid config")
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(networkd.subprocess, "run", reload_fails)
+    candidate = NetworkdConfiguration(
+        files={"10-kavernis-new.network": "[Match]\nName=eth1\n\n[Network]\n"}
+    )
+
+    with pytest.raises(NetworkdApplyError, match="invalid config"):
+        networkd.apply(candidate, tmp_path)
+
+    assert managed.read_text(encoding="utf-8") == "old\n"
+    assert not (tmp_path / "10-kavernis-new.network").exists()
+    assert unmanaged.read_text(encoding="utf-8") == "keep\n"
+    assert len(calls) == 2

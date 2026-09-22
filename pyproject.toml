@@ -12,6 +12,9 @@ dependencies = [
   "PyYAML>=6.0,<7.0",
 ]
 
+[project.scripts]
+kavernis = "kavernis.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "mypy>=1.0",

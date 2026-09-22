@@ -1,8 +1,12 @@
 """Deterministic systemd-networkd configuration generation for interfaces."""
 
+import os
 import re
+import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from kavernis.models.interface import (
     IPv4AddressMode,
@@ -13,6 +17,10 @@ from kavernis.models.interface import (
 
 class NetworkdValidationError(ValueError):
     """Raised when generated networkd configuration is unsafe or malformed."""
+
+
+class NetworkdApplyError(RuntimeError):
+    """Raised when a generated networkd candidate cannot be activated."""
 
 
 @dataclass(frozen=True)
@@ -100,6 +108,85 @@ def validate(candidate: NetworkdConfiguration) -> None:
             raise NetworkdValidationError(
                 f"networkd content must end with newline: {filename}"
             )
+
+
+def apply(
+    candidate: NetworkdConfiguration,
+    directory: Path = Path("/etc/systemd/network"),
+) -> None:
+    """Install a validated candidate and ask systemd-networkd to reload it.
+
+    Only Kavernis-owned files are replaced or removed. If networkctl cannot
+    activate the candidate, the previously managed files are restored before
+    the error is reported.
+    """
+    validate(candidate)
+    previous = _managed_files(directory)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        for filename, content in candidate.files.items():
+            _write_atomically(directory / filename, content)
+        for filename in set(previous) - set(candidate.files):
+            (directory / filename).unlink()
+        subprocess.run(
+            ["networkctl", "reload"], check=True, capture_output=True, text=True
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        _restore(directory, previous)
+        try:
+            subprocess.run(
+                ["networkctl", "reload"], check=False, capture_output=True, text=True
+            )
+        except OSError:
+            pass
+        detail = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            detail = str(error.stderr).strip()
+        raise NetworkdApplyError(
+            f"cannot apply networkd configuration: {detail}"
+        ) from error
+
+
+def _managed_files(directory: Path) -> dict[str, str]:
+    """Return only existing files owned by Kavernis."""
+    if not directory.exists():
+        return {}
+    return {
+        path.name: path.read_text(encoding="utf-8")
+        for path in directory.iterdir()
+        if path.is_file()
+        and re.fullmatch(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name)
+    }
+
+
+def _write_atomically(path: Path, content: str) -> None:
+    """Replace one native configuration file without exposing partial content."""
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".kavernis-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _restore(directory: Path, previous: Mapping[str, str]) -> None:
+    """Restore the managed-file snapshot after an unsuccessful activation."""
+    if not directory.exists():
+        return
+    for path in directory.iterdir():
+        if path.is_file() and re.fullmatch(
+            r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name
+        ):
+            path.unlink()
+    for filename, content in previous.items():
+        _write_atomically(directory / filename, content)
 
 
 def _validate_vlan_netdev(filename: str, content: str) -> None:
