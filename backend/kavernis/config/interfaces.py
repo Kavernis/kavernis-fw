@@ -1,10 +1,12 @@
 from enum import StrEnum
 from ipaddress import IPv4Interface, IPv6Interface
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     field_validator,
     model_validator,
 )
@@ -66,6 +68,31 @@ class IPv6Config(BaseModel):
         return self
 
 
+class VLANConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    parent: str = Field(pattern=r"^[a-z][a-z0-9-]*$")
+    tag: int = Field(strict=True, ge=1, le=4094)
+
+
+class BridgeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    members: tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]*$")], ...] = Field(
+        min_length=1
+    )
+    stp: bool = Field(default=True, strict=True)
+
+    @field_validator("members")
+    @classmethod
+    def validate_unique_members(cls, members: tuple[str, ...]) -> tuple[str, ...]:
+        if len(members) != len(set(members)):
+            raise PydanticCustomError(
+                "duplicate_bridge_member", "bridge.members contains duplicate ids"
+            )
+        return members
+
+
 class InterfaceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -75,6 +102,24 @@ class InterfaceConfig(BaseModel):
     device: str
     ipv4: IPv4Config
     ipv6: IPv6Config
+    vlan: VLANConfig | None = None
+    bridge: BridgeConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_virtual_device(self) -> "InterfaceConfig":
+        if self.vlan is not None and self.bridge is not None:
+            raise PydanticCustomError(
+                "conflicting_interface_types", "vlan and bridge are mutually exclusive"
+            )
+        if (self.vlan is not None or self.bridge is not None) and (
+            len(self.device) > 15 or self.device in {".", ".."} or ":" in self.device
+        ):
+            raise PydanticCustomError(
+                "invalid_virtual_device",
+                "virtual device must be at most 15 characters, contain no colon, "
+                "and cannot be '.' or '..'",
+            )
+        return self
 
     @field_validator("id")
     @classmethod
@@ -138,4 +183,76 @@ class InterfacesConfig(BaseModel):
                     "duplicate_interface",
                     f"interfaces contains duplicate {attribute} values",
                 )
+        by_id = {interface.id: interface for interface in interfaces}
+        vlan_pairs: set[tuple[str, int]] = set()
+        for interface in interfaces:
+            if interface.vlan is None:
+                continue
+            vlan = interface.vlan
+            parent = by_id.get(vlan.parent)
+            if parent is None:
+                raise PydanticCustomError(
+                    "unknown_vlan_parent",
+                    f"interface {interface.id}: "
+                    f"vlan.parent '{vlan.parent}' does not exist",
+                )
+            if (
+                parent.id == interface.id
+                or parent.vlan is not None
+                or parent.bridge is not None
+            ):
+                raise PydanticCustomError(
+                    "invalid_vlan_parent",
+                    f"interface {interface.id}: vlan.parent must reference "
+                    "a physical interface",
+                )
+            pair = (vlan.parent, vlan.tag)
+            if pair in vlan_pairs:
+                raise PydanticCustomError(
+                    "duplicate_vlan",
+                    f"interface {interface.id}: duplicate vlan.tag {vlan.tag} "
+                    f"on vlan.parent '{vlan.parent}'",
+                )
+            vlan_pairs.add(pair)
+        owners: dict[str, str] = {}
+        vlan_parents = {
+            interface.vlan.parent
+            for interface in interfaces
+            if interface.vlan is not None
+        }
+        for interface in interfaces:
+            if interface.bridge is None:
+                continue
+            for member_id in interface.bridge.members:
+                context = f"interface {interface.id}: bridge.members '{member_id}'"
+                member = by_id.get(member_id)
+                if member is None:
+                    raise PydanticCustomError(
+                        "unknown_bridge_member", f"{context} does not exist"
+                    )
+                if member.bridge is not None:
+                    raise PydanticCustomError(
+                        "invalid_bridge_member", f"{context} must not be a bridge"
+                    )
+                if member_id in owners:
+                    raise PydanticCustomError(
+                        "shared_bridge_member",
+                        f"{context} already belongs to bridge '{owners[member_id]}'",
+                    )
+                if (
+                    member.ipv4.mode is not IPv4Mode.DISABLED
+                    or member.ipv6.mode is not IPv6Mode.DISABLED
+                ):
+                    raise PydanticCustomError(
+                        "addressed_bridge_member",
+                        f"{context} must have ipv4.mode and ipv6.mode disabled; "
+                        "configure IP addressing on the bridge",
+                    )
+                if member_id in vlan_parents:
+                    raise PydanticCustomError(
+                        "bridged_vlan_parent",
+                        f"{context} is a VLAN parent; "
+                        "bridge its VLAN interfaces instead",
+                    )
+                owners[member_id] = interface.id
         return interfaces

@@ -1,0 +1,24 @@
+version: 1
+
+interfaces:
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000001"
+    id: trunk
+    name: VLAN trunk
+    device: eth1
+    ipv4:
+      mode: disabled
+    ipv6:
+      mode: disabled
+
+  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000002"
+    id: guests
+    name: Guests VLAN
+    device: eth1.20
+    vlan:
+      parent: trunk
+      tag: 20
+    ipv4:
+      mode: static
+      address: 192.168.20.1/24
+    ipv6:
+      mode: disabled

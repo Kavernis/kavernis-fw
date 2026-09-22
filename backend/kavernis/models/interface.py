@@ -30,6 +30,18 @@ class IPv6Settings:
 
 
 @dataclass(frozen=True)
+class VLANSettings:
+    parent: str
+    tag: int
+
+
+@dataclass(frozen=True)
+class BridgeSettings:
+    members: tuple[str, ...]
+    stp: bool = True
+
+
+@dataclass(frozen=True)
 class NetworkInterface:
     uid: UUID
     id: str
@@ -37,3 +49,5 @@ class NetworkInterface:
     device: str
     ipv4: IPv4Settings
     ipv6: IPv6Settings
+    vlan: VLANSettings | None = None
+    bridge: BridgeSettings | None = None
