@@ -1,18 +1,27 @@
 """Deterministic systemd-networkd configuration generation for interfaces."""
 
+import os
 import re
+import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from kavernis.models.interface import (
     IPv4AddressMode,
     IPv6AddressMode,
     NetworkInterface,
 )
+from kavernis.rendering import render_template
 
 
 class NetworkdValidationError(ValueError):
     """Raised when generated networkd configuration is unsafe or malformed."""
+
+
+class NetworkdApplyError(RuntimeError):
+    """Raised when a generated networkd candidate cannot be activated."""
 
 
 @dataclass(frozen=True)
@@ -20,6 +29,35 @@ class NetworkdConfiguration:
     """Generated files, kept in memory until a future safe apply operation."""
 
     files: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class NetworkTemplateContext:
+    """Fully resolved values needed to render one systemd-networkd file."""
+
+    device: str
+    addresses: tuple[str, ...]
+    dhcp: str | None
+    ipv6_accept_ra: str | None
+    link_local_addressing: str | None
+    vlans: tuple[str, ...]
+    bridge: str | None
+
+
+@dataclass(frozen=True)
+class VlanNetdevTemplateContext:
+    """Fully resolved values needed to render one VLAN .netdev file."""
+
+    device: str
+    tag: int
+
+
+@dataclass(frozen=True)
+class BridgeNetdevTemplateContext:
+    """Fully resolved values needed to render one bridge .netdev file."""
+
+    device: str
+    stp: str
 
 
 def generate(interfaces: Sequence[NetworkInterface]) -> NetworkdConfiguration:
@@ -56,15 +94,21 @@ def generate(interfaces: Sequence[NetworkInterface]) -> NetworkdConfiguration:
             interface, children[interface.id], bridges.get(interface.id)
         )
         if interface.vlan is not None:
-            files[f"{stem}.netdev"] = (
-                f"[NetDev]\nName={interface.device}\nKind=vlan\n\n"
-                f"[VLAN]\nId={interface.vlan.tag}\n"
+            vlan_context = VlanNetdevTemplateContext(
+                device=interface.device, tag=interface.vlan.tag
+            )
+            files[f"{stem}.netdev"] = render_template(
+                "interfaces/vlan.netdev.j2",
+                asdict(vlan_context),
             )
         elif interface.bridge is not None:
-            stp = "yes" if interface.bridge.stp else "no"
-            files[f"{stem}.netdev"] = (
-                f"[NetDev]\nName={interface.device}\nKind=bridge\n\n"
-                f"[Bridge]\nSTP={stp}\n"
+            bridge_context = BridgeNetdevTemplateContext(
+                device=interface.device,
+                stp="yes" if interface.bridge.stp else "no",
+            )
+            files[f"{stem}.netdev"] = render_template(
+                "interfaces/bridge.netdev.j2",
+                asdict(bridge_context),
             )
     candidate = NetworkdConfiguration(files=files)
     validate(candidate)
@@ -100,6 +144,85 @@ def validate(candidate: NetworkdConfiguration) -> None:
             raise NetworkdValidationError(
                 f"networkd content must end with newline: {filename}"
             )
+
+
+def apply(
+    candidate: NetworkdConfiguration,
+    directory: Path = Path("/etc/systemd/network"),
+) -> None:
+    """Install a validated candidate and ask systemd-networkd to reload it.
+
+    Only Kavernis-owned files are replaced or removed. If networkctl cannot
+    activate the candidate, the previously managed files are restored before
+    the error is reported.
+    """
+    validate(candidate)
+    previous = _managed_files(directory)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        for filename, content in candidate.files.items():
+            _write_atomically(directory / filename, content)
+        for filename in set(previous) - set(candidate.files):
+            (directory / filename).unlink()
+        subprocess.run(
+            ["networkctl", "reload"], check=True, capture_output=True, text=True
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        _restore(directory, previous)
+        try:
+            subprocess.run(
+                ["networkctl", "reload"], check=False, capture_output=True, text=True
+            )
+        except OSError:
+            pass
+        detail = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            detail = str(error.stderr).strip()
+        raise NetworkdApplyError(
+            f"cannot apply networkd configuration: {detail}"
+        ) from error
+
+
+def _managed_files(directory: Path) -> dict[str, str]:
+    """Return only existing files owned by Kavernis."""
+    if not directory.exists():
+        return {}
+    return {
+        path.name: path.read_text(encoding="utf-8")
+        for path in directory.iterdir()
+        if path.is_file()
+        and re.fullmatch(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name)
+    }
+
+
+def _write_atomically(path: Path, content: str) -> None:
+    """Replace one native configuration file without exposing partial content."""
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".kavernis-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _restore(directory: Path, previous: Mapping[str, str]) -> None:
+    """Restore the managed-file snapshot after an unsuccessful activation."""
+    if not directory.exists():
+        return
+    for path in directory.iterdir():
+        if path.is_file() and re.fullmatch(
+            r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name
+        ):
+            path.unlink()
+    for filename, content in previous.items():
+        _write_atomically(directory / filename, content)
 
 
 def _validate_vlan_netdev(filename: str, content: str) -> None:
@@ -156,41 +279,52 @@ def _render_interface(
     vlans: Sequence[str] = (),
     bridge: str | None = None,
 ) -> str:
-    network_settings: list[str] = []
-    ipv4_dhcp = interface.ipv4.mode is IPv4AddressMode.DHCP
-    ipv6_dhcp = interface.ipv6.mode is IPv6AddressMode.DHCP6
+    """Resolve network intent into the limited context used by the template."""
+    addresses: list[str] = []
+    ipv6_accept_ra: str | None = None
 
     if interface.ipv4.mode is IPv4AddressMode.STATIC:
         if interface.ipv4.address is None:
             raise NetworkdValidationError(
                 f"static IPv4 interface {interface.id} has no address"
             )
-        network_settings.append(f"Address={interface.ipv4.address}")
+        addresses.append(str(interface.ipv4.address))
 
     if interface.ipv6.mode is IPv6AddressMode.STATIC:
         if interface.ipv6.address is None:
             raise NetworkdValidationError(
                 f"static IPv6 interface {interface.id} has no address"
             )
-        network_settings.append(f"Address={interface.ipv6.address}")
-        network_settings.append("IPv6AcceptRA=no")
+        addresses.append(str(interface.ipv6.address))
+        ipv6_accept_ra = "no"
     elif interface.ipv6.mode is IPv6AddressMode.SLAAC:
-        network_settings.append("IPv6AcceptRA=yes")
+        ipv6_accept_ra = "yes"
     elif interface.ipv6.mode is IPv6AddressMode.DISABLED:
-        network_settings.append("IPv6AcceptRA=no")
+        ipv6_accept_ra = "no"
 
-    if ipv4_dhcp and ipv6_dhcp:
-        network_settings.append("DHCP=yes")
-    elif ipv4_dhcp:
-        network_settings.append("DHCP=ipv4")
-    elif ipv6_dhcp:
-        network_settings.append("DHCP=ipv6")
+    dhcp: str | None = None
+    if (
+        interface.ipv4.mode is IPv4AddressMode.DHCP
+        and interface.ipv6.mode is IPv6AddressMode.DHCP6
+    ):
+        dhcp = "yes"
+    elif interface.ipv4.mode is IPv4AddressMode.DHCP:
+        dhcp = "ipv4"
+    elif interface.ipv6.mode is IPv6AddressMode.DHCP6:
+        dhcp = "ipv6"
 
-    network_settings.extend(f"VLAN={device}" for device in vlans)
+    link_local_addressing: str | None = None
     if bridge is not None:
-        network_settings.extend(
-            ["DHCP=no", "LinkLocalAddressing=no", f"Bridge={bridge}"]
-        )
+        dhcp = "no"
+        link_local_addressing = "no"
 
-    lines = ["[Match]", f"Name={interface.device}", "", "[Network]", *network_settings]
-    return "\n".join(lines) + "\n"
+    context = NetworkTemplateContext(
+        device=interface.device,
+        addresses=tuple(addresses),
+        dhcp=dhcp,
+        ipv6_accept_ra=ipv6_accept_ra,
+        link_local_addressing=link_local_addressing,
+        vlans=tuple(vlans),
+        bridge=bridge,
+    )
+    return render_template("interfaces/network.j2", asdict(context))

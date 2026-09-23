@@ -1,0 +1,11 @@
+[Match]
+Name={{ device }}
+
+[Network]
+{% for address in addresses %}Address={{ address }}
+{% endfor %}{% if ipv6_accept_ra is not none %}IPv6AcceptRA={{ ipv6_accept_ra }}
+{% endif %}{% if dhcp is not none %}DHCP={{ dhcp }}
+{% endif %}{% if link_local_addressing is not none %}LinkLocalAddressing={{ link_local_addressing }}
+{% endif %}{% for vlan in vlans %}VLAN={{ vlan }}
+{% endfor %}{% if bridge is not none %}Bridge={{ bridge }}
+{% endif -%}

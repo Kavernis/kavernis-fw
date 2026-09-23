@@ -172,8 +172,7 @@ See [the complete VLAN example](configs/examples/interfaces-vlan.yml).
 The backend generates a `.netdev` file per VLAN, a `.network` file per interface,
 and `VLAN=` attachments in the parent's `.network` file, using the native
 [systemd VLAN configuration](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
-Candidates are validated in memory; this milestone does not apply configuration
-to the host or perform native service validation.
+Candidates are validated in memory before they can be applied to the host.
 
 ### Bridge interfaces
 
@@ -212,7 +211,29 @@ of bridges and bridge VLAN filtering are not supported in this initial slice.
 member's `.network` file, following the
 [systemd bridge configuration](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
 See [the complete bridge example](configs/examples/interfaces-bridge.yml).
-Generation and validation stay in memory without modifying the host network.
+Generation and validation stay in memory until an explicit apply operation.
+
+## Command line interface
+
+The `kavernis` command reads the desired interface state from
+`/etc/kavernis/interfaces.yaml`.
+
+```bash
+kavernis plan interfaces
+```
+
+`plan` loads, validates and resolves the YAML, then prints the generated
+`systemd-networkd` files without modifying the host.
+
+```bash
+kavernis apply interfaces
+```
+
+`apply` runs the same validation and generation step, writes only the
+Kavernis-owned `10-kavernis-*` files in `/etc/systemd/network`, and invokes
+`networkctl reload`. It therefore requires the privileges needed to modify
+system network configuration. If the reload fails, the previous
+Kavernis-owned files are restored and Kavernis attempts to reload them.
 
 ## Configuration Pipeline
 
@@ -234,7 +255,10 @@ Domain model
 Dependency resolution / planning
  │
  ▼
-Backend generation
+Rendering context
+ │
+ ▼
+Jinja2 native configuration rendering
  │
  ▼
 Native configuration validation
@@ -244,6 +268,25 @@ Safe application
 ```
 
 A backend never parses Kavernis YAML directly.
+
+### Native configuration templates
+
+Native configuration templates are packaged with Kavernis and grouped by
+functional domain. The first domain is `interfaces`, whose templates render
+systemd-networkd `.network` and `.netdev` files. Future domains such as
+firewall, DHCP, DNS, routing, and VPN can use the same organization when they
+are implemented.
+
+The responsibility boundary is deliberately narrow:
+
+```text
+Python: desired state → validation → resolution → rendering context
+Jinja2: rendering context → native configuration syntax
+```
+
+Python makes all semantic decisions and validates both the domain model and the
+rendered candidate. Templates only present already-resolved values using the
+native service syntax.
 
 For example:
 
