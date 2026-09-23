@@ -255,7 +255,10 @@ Domain model
 Dependency resolution / planning
  │
  ▼
-Backend generation
+Rendering context
+ │
+ ▼
+Jinja2 native configuration rendering
  │
  ▼
 Native configuration validation
@@ -265,6 +268,25 @@ Safe application
 ```
 
 A backend never parses Kavernis YAML directly.
+
+### Native configuration templates
+
+Native configuration templates are packaged with Kavernis and grouped by
+functional domain. The first domain is `interfaces`, whose templates render
+systemd-networkd `.network` and `.netdev` files. Future domains such as
+firewall, DHCP, DNS, routing, and VPN can use the same organization when they
+are implemented.
+
+The responsibility boundary is deliberately narrow:
+
+```text
+Python: desired state → validation → resolution → rendering context
+Jinja2: rendering context → native configuration syntax
+```
+
+Python makes all semantic decisions and validates both the domain model and the
+rendered candidate. Templates only present already-resolved values using the
+native service syntax.
 
 For example:
 
