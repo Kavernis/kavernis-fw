@@ -235,6 +235,33 @@ Kavernis-owned `10-kavernis-*` files in `/etc/systemd/network`, and invokes
 system network configuration. If the reload fails, the previous
 Kavernis-owned files are restored and Kavernis attempts to reload them.
 
+### Interfaces state and history
+
+The interfaces workflow records desired-state history separately from the
+user-managed configuration directory. `/etc/kavernis/interfaces.yaml` remains
+the source of truth; Kavernis snapshots that file in its internal Git repository
+at `/var/lib/kavernis/history` only when applying changed desired state. The
+last successful apply revision and SHA-256 hashes of generated
+`10-kavernis-*` artifacts are stored in `/var/lib/kavernis/state.db`.
+
+```bash
+kavernis status interfaces
+kavernis history interfaces
+kavernis diff interfaces
+kavernis rollback interfaces <revision>
+```
+
+`status` distinguishes `in sync`, `pending changes`, `drift detected`, and
+`not yet applied`. Artifact drift covers missing, changed, and unexpected
+Kavernis-owned systemd-networkd files only. It deliberately does not yet detect
+live runtime changes made with tools such as `ip addr`.
+
+Rollback restores the requested historical `interfaces.yaml` atomically, makes
+a new history commit, and regenerates native files through the normal validated
+apply path. If native application fails, the previous managed native files and
+SQLite successful-applied revision remain in effect; the attempted rollback
+YAML remains current so the failed desired transition is explicit and auditable.
+
 ## Configuration Pipeline
 
 Configuration follows a strict processing pipeline:
