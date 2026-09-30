@@ -12,15 +12,24 @@ def load_interfaces(path: str | Path) -> InterfacesConfig:
     path = Path(path)
 
     try:
-        with path.open("r", encoding="utf-8") as file:
-            data = yaml.safe_load(file)
+        contents = path.read_text(encoding="utf-8")
     except (OSError, yaml.YAMLError) as error:
         message = f"cannot load interfaces configuration {path}: {error}"
         raise ConfigurationError(message) from error
 
+    return load_interfaces_contents(contents, f"interfaces configuration {path}")
+
+
+def load_interfaces_contents(
+    contents: str, source: str = "interfaces configuration"
+) -> InterfacesConfig:
+    """Validate interfaces YAML already obtained from a controlled source."""
+    try:
+        data = yaml.safe_load(contents)
+    except yaml.YAMLError as error:
+        raise ConfigurationError(f"cannot load {source}: {error}") from error
+
     try:
         return InterfacesConfig.model_validate(data)
     except ValidationError as error:
-        raise ConfigurationError(
-            f"invalid interfaces configuration {path}: {error}"
-        ) from error
+        raise ConfigurationError(f"invalid {source}: {error}") from error

@@ -1,5 +1,6 @@
 """Deterministic systemd-networkd configuration generation for interfaces."""
 
+import hashlib
 import os
 import re
 import subprocess
@@ -14,6 +15,7 @@ from kavernis.models.interface import (
     NetworkInterface,
 )
 from kavernis.rendering import render_template
+from kavernis.state.models import ArtifactDrift, ArtifactDriftKind
 
 
 class NetworkdValidationError(ValueError):
@@ -183,12 +185,58 @@ def apply(
         ) from error
 
 
+def artifact_hashes(candidate: NetworkdConfiguration) -> dict[str, str]:
+    """Return deterministic SHA-256 hashes for a validated managed candidate."""
+    validate(candidate)
+    return {
+        filename: hashlib.sha256(content.encode("utf-8")).hexdigest()
+        for filename, content in sorted(candidate.files.items())
+    }
+
+
+def inspect_artifact_drift(
+    expected_hashes: Mapping[str, str],
+    directory: Path = Path("/etc/systemd/network"),
+) -> tuple[ArtifactDrift, ...]:
+    """Compare only Kavernis-owned networkd artifacts with applied hashes."""
+    try:
+        actual = _managed_files_bytes(directory)
+    except OSError as error:
+        raise NetworkdApplyError(
+            f"cannot inspect networkd artifacts: {error}"
+        ) from error
+    drift: list[ArtifactDrift] = []
+    for filename, expected_hash in sorted(expected_hashes.items()):
+        contents = actual.pop(filename, None)
+        if contents is None:
+            drift.append(ArtifactDrift(filename, ArtifactDriftKind.MISSING))
+        elif hashlib.sha256(contents).hexdigest() != expected_hash:
+            drift.append(ArtifactDrift(filename, ArtifactDriftKind.MODIFIED))
+    drift.extend(
+        ArtifactDrift(filename, ArtifactDriftKind.UNEXPECTED)
+        for filename in sorted(actual)
+    )
+    return tuple(drift)
+
+
 def _managed_files(directory: Path) -> dict[str, str]:
     """Return only existing files owned by Kavernis."""
     if not directory.exists():
         return {}
     return {
         path.name: path.read_text(encoding="utf-8")
+        for path in directory.iterdir()
+        if path.is_file()
+        and re.fullmatch(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name)
+    }
+
+
+def _managed_files_bytes(directory: Path) -> dict[str, bytes]:
+    """Read managed artifacts as bytes for exact hash comparison."""
+    if not directory.exists():
+        return {}
+    return {
+        path.name: path.read_bytes()
         for path in directory.iterdir()
         if path.is_file()
         and re.fullmatch(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name)
