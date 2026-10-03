@@ -1,3 +1,5 @@
+import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -141,6 +143,7 @@ def test_apply_restores_managed_files_when_networkctl_reload_fails(
 
     managed = tmp_path / "10-kavernis-old.network"
     managed.write_text("old\n", encoding="utf-8")
+    managed.chmod(0o600)
     unmanaged = tmp_path / "20-unmanaged.network"
     unmanaged.write_text("keep\n", encoding="utf-8")
 
@@ -161,6 +164,81 @@ def test_apply_restores_managed_files_when_networkctl_reload_fails(
         networkd.apply(candidate, tmp_path)
 
     assert managed.read_text(encoding="utf-8") == "old\n"
+    assert stat.S_IMODE(managed.stat().st_mode) == 0o644
     assert not (tmp_path / "10-kavernis-new.network").exists()
     assert unmanaged.read_text(encoding="utf-8") == "keep\n"
     assert len(calls) == 2
+
+
+def test_apply_installs_networkd_artifacts_with_explicit_readable_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from kavernis.backends import networkd
+
+    monkeypatch.setattr(
+        networkd.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+    candidate = NetworkdConfiguration(
+        files={
+            "10-kavernis-lan.network": "[Match]\nName=eth1\n\n[Network]\n",
+            "10-kavernis-guests.netdev": (
+                "[NetDev]\nName=eth1.20\nKind=vlan\n\n[VLAN]\nId=20\n"
+            ),
+        }
+    )
+
+    networkd.apply(candidate, tmp_path)
+
+    for filename in candidate.files:
+        assert stat.S_IMODE((tmp_path / filename).stat().st_mode) == 0o644
+
+
+def test_apply_networkd_mode_is_independent_of_umask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from kavernis.backends import networkd
+
+    monkeypatch.setattr(
+        networkd.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+    candidate = NetworkdConfiguration(
+        files={"10-kavernis-lan.network": "[Match]\nName=eth1\n\n[Network]\n"}
+    )
+    old_umask = os.umask(0o077)
+    try:
+        networkd.apply(candidate, tmp_path)
+    finally:
+        os.umask(old_umask)
+
+    assert (
+        stat.S_IMODE((tmp_path / "10-kavernis-lan.network").stat().st_mode)
+        == 0o644
+    )
+
+
+def test_apply_corrects_existing_artifact_permissions_with_atomic_replace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from kavernis.backends import networkd
+
+    monkeypatch.setattr(
+        networkd.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+    artifact = tmp_path / "10-kavernis-lan.network"
+    artifact.write_text("old\n", encoding="utf-8")
+    artifact.chmod(0o600)
+    previous_inode = artifact.stat().st_ino
+    candidate = NetworkdConfiguration(
+        files={"10-kavernis-lan.network": "[Match]\nName=eth1\n\n[Network]\n"}
+    )
+
+    networkd.apply(candidate, tmp_path)
+
+    assert artifact.stat().st_ino != previous_inode
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o644
