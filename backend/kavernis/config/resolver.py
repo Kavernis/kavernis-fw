@@ -12,7 +12,6 @@ from kavernis.models.interface import (
 
 def resolve_interface(config: InterfaceConfig) -> NetworkInterface:
     return NetworkInterface(
-        uid=config.uid,
         id=config.id,
         name=config.name,
         device=config.device,

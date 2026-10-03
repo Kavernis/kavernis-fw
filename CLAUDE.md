@@ -170,9 +170,8 @@ Validation errors should be actionable and identify the relevant object and fiel
 
 ## 5. Object Identity
 
-Configuration objects use two distinct identifiers:
+Configuration objects use `domain + id` as their immutable logical identity.
 
-* `uid` — immutable technical identifier, normally UUID-based
 * `id` — immutable human-readable identifier used for configuration references
 
 `name` is a mutable display attribute.
@@ -180,15 +179,14 @@ Configuration objects use two distinct identifiers:
 Example:
 
 ```yaml id="aj2b5c"
-- uid: "8f3a7c22-1c7d-4d6b-a901-000000000002"
-  id: lan
+- id: lan
   name: Users LAN
   device: eth1
 ```
 
 References between configuration objects SHOULD use `id`.
 
-Neither `uid` nor `id` should be silently changed after object creation.
+`id` should not be silently changed after object creation.
 
 A future `id` rename operation must be explicit and transactional so references can be updated safely.
 

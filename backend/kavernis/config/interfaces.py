@@ -1,7 +1,6 @@
 from enum import StrEnum
 from ipaddress import IPv4Interface, IPv6Interface
 from typing import Annotated
-from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -96,7 +95,6 @@ class BridgeConfig(BaseModel):
 class InterfaceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    uid: UUID
     id: str
     name: str
     device: str
@@ -176,7 +174,7 @@ class InterfacesConfig(BaseModel):
             raise PydanticCustomError(
                 "interfaces_required", "interfaces must contain at least one interface"
             )
-        for attribute in ("uid", "id", "device"):
+        for attribute in ("id", "device"):
             values = [getattr(interface, attribute) for interface in interfaces]
             if len(values) != len(set(values)):
                 raise PydanticCustomError(

@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
 from ipaddress import IPv4Interface, IPv6Interface
-from uuid import UUID
 
 
 class IPv4AddressMode(Enum):
@@ -43,7 +42,6 @@ class BridgeSettings:
 
 @dataclass(frozen=True)
 class NetworkInterface:
-    uid: UUID
     id: str
     name: str
     device: str
