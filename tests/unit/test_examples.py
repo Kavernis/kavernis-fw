@@ -15,6 +15,7 @@ def test_examples_use_yaml_extension_and_parse() -> None:
 
     assert not list(examples.glob("*.yml"))
     assert load_interfaces(examples / "interfaces.yaml")
+    assert load_interfaces(examples / "interfaces-dhcp-only.yaml")
     assert load_interfaces(examples / "interfaces-dhcp-options.yaml")
     assert load_interfaces(examples / "interfaces-vlan.yaml")
     assert load_interfaces(examples / "interfaces-bridge.yaml")

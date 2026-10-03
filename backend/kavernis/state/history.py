@@ -31,9 +31,12 @@ class DesiredStateHistory:
         """Commit a changed desired-state snapshot, or return the existing revision."""
         self._validate_files(files)
         self._initialize()
+        tracked = set(self.file_names())
         for filename, contents in files.items():
             (self.repository_path / filename).write_bytes(contents)
-        self._run("add", "--", *sorted(files))
+        for filename in tracked - set(files):
+            (self.repository_path / filename).unlink(missing_ok=True)
+        self._run("add", "-A", "--", *sorted(tracked | set(files)))
         diff = self._run("diff", "--cached", "--quiet", check=False)
         if diff.returncode == 0:
             return self.current_revision() or self._unexpected(
@@ -59,11 +62,33 @@ class DesiredStateHistory:
         revision = self.current_revision()
         if revision is None:
             return None
-        for filename, contents in files.items():
-            result = self._run("show", f"HEAD:{filename}", check=False)
-            if result.returncode != 0 or result.stdout.encode() != contents:
-                return None
-        return revision
+        return revision if self.contents_match(revision, files) else None
+
+    def contents_match(self, revision: str, files: Mapping[str, bytes]) -> bool:
+        """Whether a revision exactly represents the supplied filesystem state."""
+        self._validate_files(files)
+        if set(self.file_names(revision)) != set(files):
+            return False
+        return all(
+            self.read_revision(revision, filename) == contents
+            for filename, contents in files.items()
+        )
+
+    def file_names(self, revision: str | None = None) -> tuple[str, ...]:
+        """Return the desired-state files physically present in a revision."""
+        self._initialize()
+        target = revision or "HEAD"
+        if revision is not None:
+            target = self._resolve_revision(revision)
+        result = self._run("ls-tree", "-r", "--name-only", target, check=False)
+        if result.returncode != 0:
+            if revision is None:
+                return ()
+            raise RevisionNotFoundError(f"desired-state revision not found: {revision}")
+        names = tuple(name for name in result.stdout.splitlines() if name)
+        if names:
+            self._validate_files({name: b"" for name in names})
+        return names
 
     def list_revisions(self) -> list[HistoryRevision]:
         self._initialize()
