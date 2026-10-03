@@ -1,6 +1,9 @@
 """Command line interface for Kavernis desired-state operations."""
 
 import argparse
+import os
+import shlex
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -9,6 +12,9 @@ from kavernis.backends.networkd import NetworkdApplyError, NetworkdConfiguration
 from kavernis.config.errors import ConfigurationError
 from kavernis.core.network import (
     NETWORK_DOMAIN,
+    DesiredStateChangedError,
+    EditorFailedError,
+    EditValidationError,
     NetworkStatePaths,
     NetworkStateService,
     NetworkStatus,
@@ -16,6 +22,7 @@ from kavernis.core.network import (
     plan_network,
 )
 from kavernis.state.history import HistoryError
+from kavernis.state.lock import LockUnavailableError
 from kavernis.state.sqlite import StateStoreError
 
 INTERFACES_PATH = "/etc/kavernis/interfaces.yaml"
@@ -24,7 +31,7 @@ ROUTES_PATH = "/etc/kavernis/routes.yaml"
 HISTORY_PATH = "/var/lib/kavernis/history"
 STATE_DATABASE_PATH = "/var/lib/kavernis/state.db"
 NETWORKD_PATH = "/etc/systemd/network"
-STATE_LOCK_PATH = "/var/lib/kavernis/state.lock"
+STATE_LOCK_PATH = "/run/kavernis/network.lock"
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -39,6 +46,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     ):
         command = action.add_parser(name, help=help_text)
         command.add_argument("resource", choices=("network",))
+    edit_command = action.add_parser(
+        "edit", help="safely edit one network desired-state resource"
+    )
+    edit_command.add_argument(
+        "resource", choices=("interfaces", "gateways", "routes")
+    )
     diff_command = action.add_parser("diff", help="show desired-state differences")
     diff_command.add_argument("resource", choices=("network",))
     diff_command.add_argument("revision", nargs="?")
@@ -64,13 +77,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "Rolled back and applied "
                 f"{len(candidate.files)} systemd-networkd file(s)."
             )
+        elif parsed.action == "edit":
+            changed = service.edit_resource(parsed.resource, _invoke_editor)
+            print("Updated desired state." if changed else "No changes.")
+        elif parsed.action == "apply":
+            candidate = service.apply()
+            print(f"Applied {len(candidate.files)} systemd-networkd file(s).")
         else:
             desired = load_network(service.paths)
             if parsed.action == "plan":
                 _print_candidate(plan_network(desired))
-            elif parsed.action == "apply":
-                candidate = service.apply(desired)
-                print(f"Applied {len(candidate.files)} systemd-networkd file(s).")
             else:
                 if parsed.action == "status":
                     _print_status(service.status(desired.files))
@@ -89,6 +105,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         HistoryError,
         NetworkdApplyError,
         StateStoreError,
+        LockUnavailableError,
+        DesiredStateChangedError,
+        EditValidationError,
+        EditorFailedError,
         ValueError,
         OSError,
     ) as error:
@@ -104,6 +124,24 @@ def _print_candidate(candidate: NetworkdConfiguration) -> None:
             print()
         print(f"--- {filename}")
         print(content, end="")
+
+
+def _editor_command() -> list[str]:
+    """Select a conventional editor command without using a shell."""
+    configured = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
+    command = shlex.split(configured)
+    if not command:
+        raise ValueError("VISUAL or EDITOR does not contain an editor command")
+    return command
+
+
+def _invoke_editor(path: Path) -> int:
+    """Run the selected editor on a controlled temporary YAML file."""
+    try:
+        completed = subprocess.run([*_editor_command(), str(path)], check=False)
+    except OSError as error:
+        raise EditorFailedError(f"cannot start editor: {error}") from error
+    return completed.returncode
 
 
 def _state_service() -> NetworkStateService:
