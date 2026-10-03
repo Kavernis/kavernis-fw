@@ -1,8 +1,7 @@
 version: 1
 
 interfaces:
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000001"
-    id: lan-one
+  - id: lan-one
     name: LAN port 1
     device: eth1
     ipv4:
@@ -10,8 +9,7 @@ interfaces:
     ipv6:
       mode: disabled
 
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000002"
-    id: lan-two
+  - id: lan-two
     name: LAN port 2
     device: eth2
     ipv4:
@@ -19,8 +17,7 @@ interfaces:
     ipv6:
       mode: disabled
 
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000003"
-    id: lan
+  - id: lan
     name: LAN bridge
     device: br0
     bridge:

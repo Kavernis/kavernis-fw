@@ -20,7 +20,6 @@ def configuration() -> dict:
         "version": 1,
         "interfaces": [
             {
-                "uid": "8f3a7c22-1c7d-4d6b-a901-000000000001",
                 "id": "trunk",
                 "name": "Trunk",
                 "device": "eth1",
@@ -28,7 +27,6 @@ def configuration() -> dict:
                 "ipv6": {"mode": "disabled"},
             },
             {
-                "uid": "8f3a7c22-1c7d-4d6b-a901-000000000002",
                 "id": "guest",
                 "name": "Guests",
                 "device": "eth1.20",
@@ -107,9 +105,7 @@ def test_reject_invalid_vlan_device(device: str) -> None:
 
 def add_vlan(data: dict) -> dict:
     other = deepcopy(data["interfaces"][1])
-    other.update(
-        uid="8f3a7c22-1c7d-4d6b-a901-000000000003", id="staff", device="eth1.30"
-    )
+    other.update(id="staff", device="eth1.30")
     data["interfaces"].append(other)
     return other
 
@@ -146,9 +142,7 @@ def test_same_tag_allowed_on_different_parents() -> None:
     data = configuration()
     other = add_vlan(data)
     parent = deepcopy(data["interfaces"][0])
-    parent.update(
-        uid="8f3a7c22-1c7d-4d6b-a901-000000000004", id="uplink", device="eth2"
-    )
+    parent.update(id="uplink", device="eth2")
     data["interfaces"].append(parent)
     other["vlan"]["parent"] = "uplink"
     candidate = plan_interfaces(InterfacesConfig.model_validate(data))

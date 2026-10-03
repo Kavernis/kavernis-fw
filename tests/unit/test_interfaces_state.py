@@ -14,8 +14,7 @@ from kavernis.core.interfaces import (
 def desired(address: str) -> bytes:
     return f"""version: 1
 interfaces:
-  - uid: 8f3a7c22-1c7d-4d6b-a901-000000000001
-    id: lan
+  - id: lan
     name: Users LAN
     device: eth1
     ipv4: {{mode: static, address: {address}}}

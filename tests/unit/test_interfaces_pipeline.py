@@ -1,6 +1,5 @@
 import subprocess
 from pathlib import Path
-from uuid import UUID
 
 import pytest
 from kavernis.backends.networkd import (
@@ -28,7 +27,6 @@ def configuration() -> InterfacesConfig:
             "version": 1,
             "interfaces": [
                 {
-                    "uid": "8f3a7c22-1c7d-4d6b-a901-000000000001",
                     "id": "lan",
                     "name": "Users LAN",
                     "device": "eth1",
@@ -36,7 +34,6 @@ def configuration() -> InterfacesConfig:
                     "ipv6": {"mode": "slaac"},
                 },
                 {
-                    "uid": "8f3a7c22-1c7d-4d6b-a901-000000000002",
                     "id": "wan",
                     "name": "WAN",
                     "device": "eth0",
@@ -51,7 +48,7 @@ def configuration() -> InterfacesConfig:
 def test_resolve_interfaces_preserves_typed_network_intent() -> None:
     interfaces = resolve_interfaces(configuration())
 
-    assert interfaces[0].uid == UUID("8f3a7c22-1c7d-4d6b-a901-000000000001")
+    assert interfaces[0].id == "lan"
     assert interfaces[0].ipv4.mode is IPv4AddressMode.STATIC
     assert interfaces[0].ipv6.mode is IPv6AddressMode.SLAAC
     assert interfaces[1].ipv4.mode is IPv4AddressMode.DHCP
@@ -79,7 +76,6 @@ def test_plan_interfaces_disables_ipv6_router_advertisements() -> None:
             "version": 1,
             "interfaces": [
                 {
-                    "uid": "8f3a7c22-1c7d-4d6b-a901-000000000003",
                     "id": "isolated",
                     "name": "Isolated",
                     "device": "eth2",
@@ -108,7 +104,6 @@ def test_reject_unsafe_generated_candidate() -> None:
 
 def test_reject_incomplete_domain_model_before_generation() -> None:
     interface = NetworkInterface(
-        uid=UUID("8f3a7c22-1c7d-4d6b-a901-000000000004"),
         id="invalid",
         name="Invalid",
         device="eth3",

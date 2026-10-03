@@ -758,18 +758,17 @@ Kavernis is currently a local system controller, not a distributed control plane
 
 ## 16. Object Identity
 
-Configuration objects use two distinct identifiers:
+Configuration objects use `domain + id` as their immutable logical identity.
 
-* `uid` — immutable technical identifier, normally UUID-based
 * `id` — immutable human-readable identifier used for configuration references
 
 `name` is a mutable display attribute.
 
 References between configuration objects SHOULD use `id`.
 
-Neither `uid` nor `id` should be silently changed after object creation.
+`id` should not be silently changed after object creation.
 
-Historical revisions MUST preserve these identifiers exactly.
+Historical revisions MUST preserve `id` exactly.
 
 Rollback MUST NOT regenerate object identifiers.
 
@@ -1010,4 +1009,3 @@ State management extends this principle:
 > **Know what was requested. Know what was applied. Know what is running. Be able to explain and recover every transition.**
 
 Kavernis architecture should remain simple enough to understand, deterministic enough to reproduce, auditable enough to trust, and recoverable enough to operate safely.
-

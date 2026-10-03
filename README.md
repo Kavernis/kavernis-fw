@@ -113,8 +113,7 @@ For example:
 version: 1
 
 interfaces:
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000001"
-    id: wan
+  - id: wan
     name: WAN
     device: eth0
 
@@ -124,8 +123,7 @@ interfaces:
     ipv6:
       mode: dhcp6
 
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000002"
-    id: lan
+  - id: lan
     name: LAN
     device: eth1
 
@@ -149,8 +147,7 @@ of a physical interface in the same document, and `tag` is an integer from 1 to
 Existing interface declarations without a `vlan` block remain unchanged.
 
 ```yaml
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000003"
-    id: guests
+  - id: guests
     name: Guests VLAN
     device: eth1.20
     vlan:
@@ -180,8 +177,7 @@ A bridge joins physical or VLAN interfaces into one layer-2 network. Declare a
 separate interface with a `bridge` block, referencing member interface `id`s:
 
 ```yaml
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000004"
-    id: lan-bridge
+  - id: lan-bridge
     name: LAN bridge
     device: br0
     bridge:

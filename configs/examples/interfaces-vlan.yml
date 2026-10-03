@@ -1,8 +1,7 @@
 version: 1
 
 interfaces:
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000001"
-    id: trunk
+  - id: trunk
     name: VLAN trunk
     device: eth1
     ipv4:
@@ -10,8 +9,7 @@ interfaces:
     ipv6:
       mode: disabled
 
-  - uid: "8f3a7c22-1c7d-4d6b-a901-000000000002"
-    id: guests
+  - id: guests
     name: Guests VLAN
     device: eth1.20
     vlan:

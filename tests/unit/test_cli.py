@@ -8,8 +8,7 @@ def write_interfaces_config(path: Path) -> None:
     path.write_text(
         """version: 1
 interfaces:
-  - uid: 8f3a7c22-1c7d-4d6b-a901-000000000001
-    id: lan
+  - id: lan
     name: Users LAN
     device: eth1
     ipv4: {mode: dhcp}

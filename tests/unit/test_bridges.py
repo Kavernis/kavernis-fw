@@ -22,16 +22,17 @@ from pydantic import ValidationError
 def configuration() -> dict[str, Any]:
     interfaces = [
         {
-            "uid": f"8f3a7c22-1c7d-4d6b-a901-{index:012d}",
             "id": identifier,
             "name": identifier,
             "device": device,
             "ipv4": {"mode": "disabled"},
             "ipv6": {"mode": "disabled"},
         }
-        for index, (identifier, device) in enumerate(
-            [("lan-one", "eth1"), ("lan-two", "eth2"), ("lan", "br0")], start=1
-        )
+        for identifier, device in [
+            ("lan-one", "eth1"),
+            ("lan-two", "eth2"),
+            ("lan", "br0"),
+        ]
     ]
     interfaces[2]["bridge"] = {"members": ["lan-one", "lan-two"]}
     interfaces[2]["ipv4"] = {"mode": "static", "address": "192.168.10.1/24"}
@@ -103,7 +104,7 @@ def test_reject_invalid_bridge_member(member: str) -> None:
 def test_reject_shared_member_and_nested_bridge() -> None:
     data = configuration()
     second = deepcopy(data["interfaces"][2])
-    second.update(uid="8f3a7c22-1c7d-4d6b-a901-000000000004", id="other", device="br1")
+    second.update(id="other", device="br1")
     data["interfaces"].append(second)
     with pytest.raises(ValidationError, match="already belongs"):
         InterfacesConfig.model_validate(data)
@@ -147,7 +148,7 @@ def test_reject_bridge_and_vlan_on_same_interface() -> None:
 def test_bridge_supports_vlan_members() -> None:
     data = configuration()
     trunk = deepcopy(data["interfaces"][0])
-    trunk.update(uid="8f3a7c22-1c7d-4d6b-a901-000000000004", id="trunk", device="eth3")
+    trunk.update(id="trunk", device="eth3")
     data["interfaces"].append(trunk)
     data["interfaces"][0]["vlan"] = {"parent": "trunk", "tag": 20}
     data["interfaces"][0]["device"] = "eth3.20"

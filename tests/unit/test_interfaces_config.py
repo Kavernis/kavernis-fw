@@ -13,7 +13,6 @@ def valid_configuration() -> dict[str, object]:
         "version": 1,
         "interfaces": [
             {
-                "uid": "8f3a7c22-1c7d-4d6b-a901-000000000001",
                 "id": "lan",
                 "name": "LAN",
                 "device": "eth0",
@@ -59,13 +58,20 @@ def test_reject_invalid_ip_configuration(mutation: object, field: str) -> None:
         InterfacesConfig.model_validate(data)
 
 
-def test_reject_duplicate_interface_identity() -> None:
+def test_reject_duplicate_interface_id() -> None:
     data = valid_configuration()
     duplicate = deepcopy(data["interfaces"][0])
-    duplicate["id"] = "guest"
     data["interfaces"].append(duplicate)
 
-    with pytest.raises(ValidationError, match="duplicate uid"):
+    with pytest.raises(ValidationError, match="duplicate id"):
+        InterfacesConfig.model_validate(data)
+
+
+def test_reject_obsolete_uid_in_current_configuration() -> None:
+    data = valid_configuration()
+    data["interfaces"][0]["uid"] = "8f3a7c22-1c7d-4d6b-a901-000000000001"
+
+    with pytest.raises(ValidationError, match="uid"):
         InterfacesConfig.model_validate(data)
 
 
