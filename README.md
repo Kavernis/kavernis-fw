@@ -101,6 +101,8 @@ A future installation may use a structure similar to:
 ```text
 /etc/kavernis/
 ├── interfaces.yaml
+├── gateways.yaml
+├── routes.yaml
 ├── firewall.yaml
 ├── dhcp.yaml
 ├── dns.yaml
@@ -138,6 +140,45 @@ interfaces:
 The YAML configuration represents the desired state.
 
 Generated files such as nftables rulesets or systemd-networkd configuration are implementation artifacts and are not the source of truth.
+
+### Static gateways and routes
+
+`interfaces.yaml` configures devices and addressing. `gateways.yaml` defines
+logical static next-hops (or a direct-interface exit), and `routes.yaml` maps a
+destination network to a gateway id. Routes are rendered into the resolved
+interface's systemd-networkd `.network` file as part of the normal
+`kavernis plan network` and `kavernis apply network` transaction.
+
+```yaml
+# gateways.yaml
+version: 1
+gateways:
+  - id: internet
+    name: Internet router
+    interface: wan
+    address: 192.168.0.254
+  - id: vpn-direct
+    name: VPN direct
+    interface: vpn0
+
+# routes.yaml
+version: 1
+routes:
+  - id: default-v4
+    network: 0.0.0.0/0
+    gateway: internet
+  - id: vpn-network
+    network: 10.50.0.0/16
+    gateway: vpn-direct
+```
+
+An addressed gateway must belong to a statically configured subnet on its
+referenced interface. `onlink: true` is an explicit assertion that it is
+directly reachable despite that not being provable from static addressing; it
+does not bypass IP-family checks. A direct gateway has no address and renders a
+route without `Gateway=`. DHCP-provided addresses, gateways, and routes remain
+managed by the existing DHCP interface behavior and are not represented as
+gateway objects.
 
 ### VLAN interfaces
 
@@ -211,18 +252,20 @@ Generation and validation stay in memory until an explicit apply operation.
 
 ## Command line interface
 
-The `kavernis` command reads the desired interface state from
-`/etc/kavernis/interfaces.yaml`.
+The `network` transactional domain reads `/etc/kavernis/interfaces.yaml`,
+`/etc/kavernis/gateways.yaml`, and `/etc/kavernis/routes.yaml` together.
+Interfaces, gateways, and routes are not independently applied because they
+contribute to the same systemd-networkd artifacts.
 
 ```bash
-kavernis plan interfaces
+kavernis plan network
 ```
 
 `plan` loads, validates and resolves the YAML, then prints the generated
 `systemd-networkd` files without modifying the host.
 
 ```bash
-kavernis apply interfaces
+kavernis apply network
 ```
 
 `apply` runs the same validation and generation step, writes only the
@@ -231,20 +274,21 @@ Kavernis-owned `10-kavernis-*` files in `/etc/systemd/network`, and invokes
 system network configuration. If the reload fails, the previous
 Kavernis-owned files are restored and Kavernis attempts to reload them.
 
-### Interfaces state and history
+### Network state and history
 
-The interfaces workflow records desired-state history separately from the
-user-managed configuration directory. `/etc/kavernis/interfaces.yaml` remains
-the source of truth; Kavernis snapshots that file in its internal Git repository
+The network workflow records desired-state history separately from the
+user-managed configuration directory. `/etc/kavernis/interfaces.yaml`,
+`gateways.yaml`, and `routes.yaml` remain the source of truth; Kavernis snapshots
+all three files as one desired network revision in its internal Git repository
 at `/var/lib/kavernis/history` only when applying changed desired state. The
 last successful apply revision and SHA-256 hashes of generated
 `10-kavernis-*` artifacts are stored in `/var/lib/kavernis/state.db`.
 
 ```bash
-kavernis status interfaces
-kavernis history interfaces
-kavernis diff interfaces
-kavernis rollback interfaces <revision>
+kavernis status network
+kavernis history network
+kavernis diff network
+kavernis rollback network <revision>
 ```
 
 `status` distinguishes `in sync`, `pending changes`, `drift detected`, and
@@ -252,8 +296,8 @@ kavernis rollback interfaces <revision>
 Kavernis-owned systemd-networkd files only. It deliberately does not yet detect
 live runtime changes made with tools such as `ip addr`.
 
-Rollback restores the requested historical `interfaces.yaml` atomically, makes
-a new history commit, and regenerates native files through the normal validated
+Rollback restores the requested historical network desired state atomically,
+makes a new history commit, and regenerates native files through the normal validated
 apply path. If native application fails, the previous managed native files and
 SQLite successful-applied revision remain in effect; the attempted rollback
 YAML remains current so the failed desired transition is explicit and auditable.

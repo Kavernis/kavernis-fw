@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kavernis.example/schemas/routes.schema.json",
+  "title": "Kavernis routes configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "routes"],
+  "properties": {
+    "version": {"const": 1},
+    "routes": {"type": "array", "items": {"$ref": "#/$defs/route"}}
+  },
+  "$defs": {
+    "route": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "network", "gateway"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "network": {"type": "string", "format": "cidr"},
+        "gateway": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "description": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

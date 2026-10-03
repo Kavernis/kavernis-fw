@@ -71,6 +71,8 @@ Examples:
 
 ```text
 /etc/kavernis/interfaces.yaml
+/etc/kavernis/gateways.yaml
+/etc/kavernis/routes.yaml
 /etc/kavernis/firewall.yaml
 /etc/kavernis/dhcp.yaml
 /etc/kavernis/dns.yaml

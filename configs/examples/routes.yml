@@ -1,0 +1,19 @@
+version: 1
+
+routes:
+  - id: default-v4
+    network: 0.0.0.0/0
+    gateway: bbox-v4
+    description: Default IPv4 route
+  - id: remote-v4
+    network: 10.20.0.0/16
+    gateway: special-v4
+    description: Remote IPv4 network
+  - id: remote-v6
+    network: 2001:db8:20::/48
+    gateway: router-v6
+    description: Remote IPv6 network
+  - id: vpn-network
+    network: 10.50.0.0/16
+    gateway: vpn-direct
+    description: Direct VPN network

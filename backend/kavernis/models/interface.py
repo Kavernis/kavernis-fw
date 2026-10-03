@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from enum import Enum
 from ipaddress import IPv4Interface, IPv6Interface
 
+from kavernis.models.routing import ResolvedRoute
+
 
 class IPv4AddressMode(Enum):
     STATIC = "static"
@@ -49,3 +51,4 @@ class NetworkInterface:
     ipv6: IPv6Settings
     vlan: VLANSettings | None = None
     bridge: BridgeSettings | None = None
+    routes: tuple[ResolvedRoute, ...] = ()

@@ -44,6 +44,16 @@ class NetworkTemplateContext:
     link_local_addressing: str | None
     vlans: tuple[str, ...]
     bridge: str | None
+    routes: tuple["RouteTemplateContext", ...]
+
+
+@dataclass(frozen=True)
+class RouteTemplateContext:
+    """Native syntax values for one fully resolved static route."""
+
+    destination: str
+    gateway: str | None
+    gateway_onlink: str | None
 
 
 @dataclass(frozen=True)
@@ -374,5 +384,13 @@ def _render_interface(
         link_local_addressing=link_local_addressing,
         vlans=tuple(vlans),
         bridge=bridge,
+        routes=tuple(
+            RouteTemplateContext(
+                destination=str(route.network),
+                gateway=str(route.gateway_address) if route.gateway_address else None,
+                gateway_onlink="yes" if route.gateway_onlink else None,
+            )
+            for route in interface.routes
+        ),
     )
     return render_template("interfaces/network.j2", asdict(context))

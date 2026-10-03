@@ -8,4 +8,9 @@ Name={{ device }}
 {% endif %}{% if link_local_addressing is not none %}LinkLocalAddressing={{ link_local_addressing }}
 {% endif %}{% for vlan in vlans %}VLAN={{ vlan }}
 {% endfor %}{% if bridge is not none %}Bridge={{ bridge }}
-{% endif -%}
+{% endif %}{% for route in routes|default(()) %}
+[Route]
+Destination={{ route.destination }}
+{% if route.gateway is not none %}Gateway={{ route.gateway }}
+{% endif %}{% if route.gateway_onlink is not none %}GatewayOnLink={{ route.gateway_onlink }}
+{% endif %}{% endfor -%}

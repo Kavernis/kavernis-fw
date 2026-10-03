@@ -1,0 +1,23 @@
+version: 1
+
+gateways:
+  - id: bbox-v4
+    name: Bbox IPv4
+    interface: wan
+    address: 192.168.0.254
+    description: Internet IPv4 gateway
+  - id: special-v4
+    name: Special IPv4 router
+    interface: servers
+    address: 10.200.0.1
+    onlink: true
+    description: Explicit off-subnet gateway
+  - id: router-v6
+    name: IPv6 router
+    interface: servers
+    address: 2001:db8:40::fe
+    description: IPv6 router
+  - id: vpn-direct
+    name: VPN direct
+    interface: vpn0
+    description: Direct VPN route
