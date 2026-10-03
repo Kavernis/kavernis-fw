@@ -165,6 +165,17 @@ def test_reject_malformed_netdev(content: str) -> None:
 
 
 def test_load_vlan_example() -> None:
-    config = load_interfaces(Path("configs/examples/interfaces-vlan.yml"))
+    config = load_interfaces(Path("configs/examples/interfaces-vlan.yaml"))
     assert config.interfaces[1].vlan is not None
     assert len(plan_interfaces(config).files) == 3
+
+
+def test_vlan_parent_with_omitted_address_families_is_unaddressed() -> None:
+    data = configuration()
+    data["interfaces"][0].pop("ipv4")
+    data["interfaces"][0].pop("ipv6")
+
+    config = InterfacesConfig.model_validate(data)
+
+    assert config.interfaces[0].ipv4.mode.value == "disabled"
+    assert config.interfaces[0].ipv6.mode.value == "disabled"

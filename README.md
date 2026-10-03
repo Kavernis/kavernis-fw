@@ -139,6 +139,15 @@ interfaces:
 
 The YAML configuration represents the desired state.
 
+`ipv4` and `ipv6` are optional on an interface. An omitted address-family block
+means `mode: disabled`, so an unaddressed interface can be written concisely:
+
+```yaml
+- id: trunk
+  name: Trunk
+  device: eth1
+```
+
 Generated files such as nftables rulesets or systemd-networkd configuration are implementation artifacts and are not the source of truth.
 
 ### Static gateways and routes
@@ -206,7 +215,7 @@ not need to follow the `parent.tag` naming convention. VLAN interfaces support
 the same IPv4 and IPv6 modes as physical interfaces. A parent can carry multiple
 VLANs and retain its own IP configuration, or use disabled IP modes for a trunk.
 
-See [the complete VLAN example](configs/examples/interfaces-vlan.yml).
+See [the complete VLAN example](configs/examples/interfaces-vlan.yaml).
 The backend generates a `.netdev` file per VLAN, a `.network` file per interface,
 and `VLAN=` attachments in the parent's `.network` file, using the native
 [systemd VLAN configuration](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
@@ -247,7 +256,7 @@ of bridges and bridge VLAN filtering are not supported in this initial slice.
 `Kind=bridge` and `STP=` in a `.netdev` file, with `Bridge=` attachments in each
 member's `.network` file, following the
 [systemd bridge configuration](https://www.freedesktop.org/software/systemd/man/systemd.netdev.html).
-See [the complete bridge example](configs/examples/interfaces-bridge.yml).
+See [the complete bridge example](configs/examples/interfaces-bridge.yaml).
 Generation and validation stay in memory until an explicit apply operation.
 
 ## Command line interface
@@ -277,17 +286,29 @@ kavernis edit routes
 ```
 
 `edit` opens a secure temporary copy using `$VISUAL`, then `$EDITOR`, then
-`nano`. It validates the resource and complete network transaction before
-atomically replacing the live YAML. All network desired-state writes share the
-same `/run/kavernis/network.lock` advisory lock. Kavernis also fingerprints all
-three YAML files with SHA-256 and refuses to overwrite an edit if any file was
-changed externally while the editor was open. The same Core transaction is
-available to future API writers.
+`nano`. It validates only the document being edited before atomically replacing
+the live YAML: interface rules within `interfaces.yaml` (such as VLAN parents
+and bridge members) remain validated there, while gateway/interface and
+route/gateway relationships are deliberately deferred. If validation fails,
+Kavernis keeps the same candidate open through a visudo-like edit-again or
+abort prompt; aborting removes the temporary candidate without changing live
+desired state.
+
+`kavernis plan network` and `kavernis apply network` load all three documents
+and perform complete cross-resource validation and resolution, including
+gateway interface references, gateway reachability, and route gateway/IP-family
+consistency. All network desired-state writes share the same
+`/run/kavernis/network.lock` advisory lock, including the full correction loop.
+Kavernis also fingerprints all three YAML files with SHA-256 and refuses to
+overwrite an edit if any file was changed externally while the editor was open.
+The same Core transaction is available to future API writers.
 
 Editing only changes desired state; it does not apply configuration or advance
 SQLite applied state. The normal workflow is:
 
 ```bash
+kavernis edit interfaces
+kavernis edit gateways
 kavernis edit routes
 kavernis plan network
 kavernis apply network

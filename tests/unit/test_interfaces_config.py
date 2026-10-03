@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from kavernis.config.errors import ConfigurationError
-from kavernis.config.interfaces import InterfacesConfig
+from kavernis.config.interfaces import InterfacesConfig, IPv4Mode, IPv6Mode
 from kavernis.config.loader import load_interfaces
 from pydantic import ValidationError
 
@@ -24,7 +24,7 @@ def valid_configuration() -> dict[str, object]:
 
 
 def test_load_example_configuration() -> None:
-    config = load_interfaces(Path("configs/examples/interfaces.yml"))
+    config = load_interfaces(Path("configs/examples/interfaces.yaml"))
 
     assert config.version == 1
     assert [interface.id for interface in config.interfaces] == ["lan", "wan"]
@@ -88,3 +88,15 @@ def test_loader_exposes_context_for_invalid_yaml(tmp_path: Path) -> None:
         ConfigurationError, match="cannot load interfaces configuration"
     ):
         load_interfaces(path)
+
+
+def test_missing_address_families_default_to_disabled() -> None:
+    config = InterfacesConfig.model_validate(
+        {
+            "version": 1,
+            "interfaces": [{"id": "trunk", "name": "Trunk", "device": "eth1"}],
+        }
+    )
+
+    assert config.interfaces[0].ipv4.mode is IPv4Mode.DISABLED
+    assert config.interfaces[0].ipv6.mode is IPv6Mode.DISABLED
