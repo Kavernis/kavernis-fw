@@ -17,6 +17,8 @@ from kavernis.models.interface import (
 from kavernis.rendering import render_template
 from kavernis.state.models import ArtifactDrift, ArtifactDriftKind
 
+NETWORKD_FILE_MODE = 0o644
+
 
 class NetworkdValidationError(ValueError):
     """Raised when generated networkd configuration is unsafe or malformed."""
@@ -254,13 +256,18 @@ def _managed_files_bytes(directory: Path) -> dict[str, bytes]:
 
 
 def _write_atomically(path: Path, content: str) -> None:
-    """Replace one native configuration file without exposing partial content."""
+    """Replace one native configuration file without exposing partial content.
+
+    Native networkd artifacts must be world-readable irrespective of the
+    process umask, tempfile defaults, or an existing artifact's mode.
+    """
     descriptor, temporary_name = tempfile.mkstemp(prefix=".kavernis-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
             temporary.write(content)
             temporary.flush()
             os.fsync(temporary.fileno())
+        os.chmod(temporary_name, NETWORKD_FILE_MODE)
         os.replace(temporary_name, path)
     except BaseException:
         try:
