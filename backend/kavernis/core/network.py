@@ -36,6 +36,8 @@ from kavernis.state.store import StateStore
 
 NETWORK_DOMAIN = "network"
 DESIRED_FILENAMES = ("interfaces.yaml", "gateways.yaml", "routes.yaml")
+MANDATORY_DESIRED_FILENAMES = ("interfaces.yaml",)
+OPTIONAL_DESIRED_FILENAMES = ("gateways.yaml", "routes.yaml")
 EDITABLE_RESOURCES = ("interfaces", "gateways", "routes")
 
 
@@ -108,9 +110,18 @@ class NetworkStateService:
             yield
 
     def desired_fingerprint(self) -> dict[str, str]:
-        """Return SHA-256 fingerprints of the actual desired-state bytes."""
+        """Fingerprint desired-state bytes and the presence of every resource.
+
+        An absent optional file is semantically an empty typed document, but it
+        remains distinct here: creating or deleting it while an editor is open
+        must be detected as a concurrent desired-state change.
+        """
         return {
-            filename: hashlib.sha256(path.read_bytes()).hexdigest()
+            filename: (
+                f"present:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+                if path.exists()
+                else "absent"
+            )
             for filename, path in self._desired_paths().items()
         }
 
@@ -160,12 +171,17 @@ class NetworkStateService:
         filename = _resource_filename(resource)
         with self.network_write_transaction():
             baseline = self.desired_fingerprint()
-            original = self._desired_paths()[filename].read_bytes()
+            path = self._desired_paths()[filename]
+            original = (
+                path.read_bytes()
+                if path.exists()
+                else _empty_desired_resource(resource)
+            )
             editable_original = _with_desired_header(resource, original)
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".kavernis-{resource}-",
                 suffix=".yaml",
-                dir=self._desired_paths()[filename].parent,
+                dir=path.parent,
             )
             candidate_path = Path(temporary_name)
             try:
@@ -224,9 +240,8 @@ class NetworkStateService:
                 NetworkStatusKind.NOT_YET_APPLIED, desired_revision, None, ()
             )
         if desired_revision != applied.revision:
-            matches = desired_revision is None and all(
-                self.history.read_revision(applied.revision, filename) == contents
-                for filename, contents in files.items()
+            matches = desired_revision is None and self.history.contents_match(
+                applied.revision, files
             )
             if not matches:
                 return NetworkStatus(
@@ -250,10 +265,15 @@ class NetworkStateService:
         return self.history.list_revisions()
 
     def diff(self, files: dict[str, bytes], revision: str) -> str:
+        historical_files = set(self.history.file_names(revision))
         return "".join(
             "".join(
                 difflib.unified_diff(
-                    self.history.read_revision(revision, filename)
+                    (
+                        self.history.read_revision(revision, filename)
+                        if filename in historical_files
+                        else b""
+                    )
                     .decode()
                     .splitlines(keepends=True),
                     contents.decode().splitlines(keepends=True),
@@ -261,14 +281,21 @@ class NetworkStateService:
                     tofile=f"{filename} (current)",
                 )
             )
-            for filename, contents in sorted(files.items())
+            for filename in sorted(set(files) | historical_files)
+            for contents in (files.get(filename, b""),)
         )
 
     def rollback(self, revision: str) -> NetworkdConfiguration:
         with self.network_write_transaction():
+            history_files = set(self.history.file_names(revision))
+            if "interfaces.yaml" not in history_files:
+                raise ConfigurationError(
+                    f"revision {revision} does not contain mandatory interfaces.yaml"
+                )
             files = {
                 filename: self.history.read_revision(revision, filename)
                 for filename in DESIRED_FILENAMES
+                if filename in history_files
             }
             desired = _desired_from_files(files, f"revision {revision}")
             candidate = plan_network(desired)
@@ -277,7 +304,10 @@ class NetworkStateService:
                 for filename, contents in files.items()
             }
             for filename, path in self._desired_paths().items():
-                _write_desired_atomically(path, written_files[filename])
+                if filename in written_files:
+                    _write_desired_atomically(path, written_files[filename])
+                elif filename in OPTIONAL_DESIRED_FILENAMES:
+                    _remove_desired(path)
             new_revision = self.history.snapshot(
                 written_files, f"rollback network to {revision[:12]}"
             )
@@ -300,12 +330,26 @@ class NetworkStateService:
 
 
 def load_network(paths: NetworkStatePaths) -> NetworkDesiredState:
-    """Load all required network desired-state files without side effects."""
-    files = {
-        "interfaces.yaml": paths.interfaces_path.read_bytes(),
-        "gateways.yaml": paths.gateways_path.read_bytes(),
-        "routes.yaml": paths.routes_path.read_bytes(),
-    }
+    """Load mandatory and optional network desired state without side effects."""
+    try:
+        interfaces = paths.interfaces_path.read_bytes()
+    except OSError as error:
+        raise ConfigurationError(
+            f"cannot load mandatory interfaces configuration "
+            f"{paths.interfaces_path}: {error}"
+        ) from error
+    files = {"interfaces.yaml": interfaces}
+    for filename, path in (
+        ("gateways.yaml", paths.gateways_path),
+        ("routes.yaml", paths.routes_path),
+    ):
+        if path.exists():
+            try:
+                files[filename] = path.read_bytes()
+            except OSError as error:
+                raise ConfigurationError(
+                    f"cannot load optional {filename} configuration {path}: {error}"
+                ) from error
     return _desired_from_files(files, "network configuration")
 
 
@@ -317,10 +361,22 @@ def plan_network(desired: NetworkDesiredState) -> NetworkdConfiguration:
 
 
 def _desired_from_files(files: dict[str, bytes], source: str) -> NetworkDesiredState:
+    if any(filename not in files for filename in MANDATORY_DESIRED_FILENAMES):
+        raise ConfigurationError(
+            f"missing mandatory interfaces configuration in {source}"
+        )
     return NetworkDesiredState(
         interfaces=load_interfaces_contents(files["interfaces.yaml"].decode(), source),
-        gateways=load_gateways_contents(files["gateways.yaml"].decode(), source),
-        routes=load_routes_contents(files["routes.yaml"].decode(), source),
+        gateways=(
+            load_gateways_contents(files["gateways.yaml"].decode(), source)
+            if "gateways.yaml" in files
+            else GatewaysConfig(version=1, gateways=[])
+        ),
+        routes=(
+            load_routes_contents(files["routes.yaml"].decode(), source)
+            if "routes.yaml" in files
+            else RoutesConfig(version=1, routes=[])
+        ),
         files=files,
     )
 
@@ -366,6 +422,19 @@ def _write_desired_atomically(path: Path, contents: bytes) -> None:
         raise
 
 
+def _remove_desired(path: Path) -> None:
+    """Remove an optional desired-state file and persist the directory change."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    directory_descriptor = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
 def _resource_filename(resource: str) -> str:
     if resource not in EDITABLE_RESOURCES:
         raise ValueError(f"unsupported network resource: {resource}")
@@ -383,3 +452,11 @@ def _with_desired_header(resource: str, contents: bytes) -> bytes:
         f'# Use "kavernis edit {resource}" to modify this file safely.\n\n'
     ).encode()
     return contents if contents.startswith(header) else header + contents
+
+
+def _empty_desired_resource(resource: str) -> bytes:
+    if resource == "gateways":
+        return b"version: 1\ngateways: []\n"
+    if resource == "routes":
+        return b"version: 1\nroutes: []\n"
+    raise ConfigurationError("interfaces.yaml is mandatory and cannot be initialized")

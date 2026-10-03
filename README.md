@@ -101,8 +101,8 @@ A future installation may use a structure similar to:
 ```text
 /etc/kavernis/
 ├── interfaces.yaml
-├── gateways.yaml
-├── routes.yaml
+├── gateways.yaml          # optional static gateway intent
+├── routes.yaml            # optional static route intent
 ├── firewall.yaml
 ├── dhcp.yaml
 ├── dns.yaml
@@ -188,6 +188,25 @@ static or disabled IPv4. `use_routes` affects only DHCP-learned routes, never
 Kavernis-declared static routes.
 See [the DHCPv4 override example](configs/examples/interfaces-dhcp-options.yaml).
 
+For a normal DHCP WAN, `interfaces.yaml` is the complete network desired state:
+
+```yaml
+version: 1
+
+interfaces:
+  - id: wan
+    name: WAN
+    device: enp1s0
+    ipv4:
+      mode: dhcp
+```
+
+No `gateways.yaml` or `routes.yaml` file is required. With the default
+`use_routes: true`, systemd-networkd accepts the gateway and routes supplied by
+DHCP. Those lease values are runtime network state, not Kavernis gateway or
+route objects. Setting `dhcp.use_routes: false` disables DHCP-learned routes;
+it does not require Kavernis to declare a static gateway or route.
+
 Kavernis YAML may omit properties that have Kavernis defaults, but generated
 native configuration explicitly encodes Kavernis-defined behavior whenever
 practical. Kavernis does not rely on native-service defaults for behavior it
@@ -197,10 +216,12 @@ Generated files such as nftables rulesets or systemd-networkd configuration are 
 
 ### Static gateways and routes
 
-`interfaces.yaml` configures devices and addressing. `gateways.yaml` defines
-logical static next-hops (or a direct-interface exit), and `routes.yaml` maps a
-destination network to a gateway id. Routes are rendered into the resolved
-interface's systemd-networkd `.network` file as part of the normal
+`interfaces.yaml` is mandatory and configures devices and addressing.
+`gateways.yaml` and `routes.yaml` are optional: when absent, they mean no
+statically declared Kavernis gateways or routes. If present, `gateways.yaml`
+defines logical static next-hops (or a direct-interface exit), and `routes.yaml`
+maps a destination network to a gateway id. Routes are rendered into the
+resolved interface's systemd-networkd `.network` file as part of the normal
 `kavernis plan network` and `kavernis apply network` transaction.
 
 ```yaml
@@ -306,10 +327,10 @@ Generation and validation stay in memory until an explicit apply operation.
 
 ## Command line interface
 
-The `network` transactional domain reads `/etc/kavernis/interfaces.yaml`,
-`/etc/kavernis/gateways.yaml`, and `/etc/kavernis/routes.yaml` together.
-Interfaces, gateways, and routes are not independently applied because they
-contribute to the same systemd-networkd artifacts.
+The `network` transactional domain requires `/etc/kavernis/interfaces.yaml` and
+loads `/etc/kavernis/gateways.yaml` and `/etc/kavernis/routes.yaml` when they
+exist. Interfaces, static gateways, and static routes are not independently
+applied because they contribute to the same systemd-networkd artifacts.
 
 ```bash
 kavernis plan network
@@ -320,8 +341,10 @@ kavernis plan network
 
 ### Safely editing desired state
 
-The three network YAML files remain ordinary, human-readable desired state and
-are the authoritative configuration. Direct writes are unsupported: use the
+The three network desired-state resources remain ordinary, human-readable,
+authoritative configuration. Only `interfaces.yaml` must exist initially;
+editing an absent optional resource starts with a valid empty document and
+creates it only when saved. Direct writes are unsupported: use the
 resource-oriented editor command instead.
 
 ```bash
@@ -339,13 +362,15 @@ Kavernis keeps the same candidate open through a visudo-like edit-again or
 abort prompt; aborting removes the temporary candidate without changing live
 desired state.
 
-`kavernis plan network` and `kavernis apply network` load all three documents
-and perform complete cross-resource validation and resolution, including
+`kavernis plan network` and `kavernis apply network` load the mandatory
+interfaces document and any present optional documents, then perform complete
+cross-resource validation and resolution, including
 gateway interface references, gateway reachability, and route gateway/IP-family
 consistency. All network desired-state writes share the same
 `/run/kavernis/network.lock` advisory lock, including the full correction loop.
-Kavernis also fingerprints all three YAML files with SHA-256 and refuses to
-overwrite an edit if any file was changed externally while the editor was open.
+Kavernis also fingerprints the bytes and presence of all three YAML paths and
+refuses to overwrite an edit if any file was changed externally while the editor
+was open. This includes creation or deletion of an optional file.
 The same Core transaction is available to future API writers.
 
 Editing only changes desired state; it does not apply configuration or advance
@@ -372,10 +397,11 @@ Kavernis-owned files are restored and Kavernis attempts to reload them.
 ### Network state and history
 
 The network workflow records desired-state history separately from the
-user-managed configuration directory. `/etc/kavernis/interfaces.yaml`,
-`gateways.yaml`, and `routes.yaml` remain the source of truth; Kavernis snapshots
-all three files as one desired network revision in its internal Git repository
-at `/var/lib/kavernis/history` only when applying changed desired state. The
+user-managed configuration directory. `/etc/kavernis/interfaces.yaml` and any
+present optional `gateways.yaml` and `routes.yaml` remain the source of truth;
+Kavernis snapshots their actual file presence as one desired network revision in
+its internal Git repository at `/var/lib/kavernis/history` only when applying
+changed desired state. The
 last successful apply revision and SHA-256 hashes of generated
 `10-kavernis-*` artifacts are stored in `/var/lib/kavernis/state.db`.
 
