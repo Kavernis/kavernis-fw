@@ -14,7 +14,6 @@ from kavernis.core.network import (
     NETWORK_DOMAIN,
     DesiredStateChangedError,
     EditorFailedError,
-    EditValidationError,
     NetworkStatePaths,
     NetworkStateService,
     NetworkStatus,
@@ -78,7 +77,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 f"{len(candidate.files)} systemd-networkd file(s)."
             )
         elif parsed.action == "edit":
-            changed = service.edit_resource(parsed.resource, _invoke_editor)
+            changed = service.edit_resource(
+                parsed.resource, _invoke_editor, _retry_invalid_edit
+            )
             print("Updated desired state." if changed else "No changes.")
         elif parsed.action == "apply":
             candidate = service.apply()
@@ -107,12 +108,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
         StateStoreError,
         LockUnavailableError,
         DesiredStateChangedError,
-        EditValidationError,
         EditorFailedError,
         ValueError,
         OSError,
     ) as error:
         print(f"Error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Aborted; desired state was unchanged.", file=sys.stderr)
         return 1
     return 0
 
@@ -142,6 +145,22 @@ def _invoke_editor(path: Path) -> int:
     except OSError as error:
         raise EditorFailedError(f"cannot start editor: {error}") from error
     return completed.returncode
+
+
+def _retry_invalid_edit(error: ConfigurationError) -> bool:
+    """Offer the CLI's visudo-like retry/abort choice after validation fails."""
+    print(f"Configuration is invalid:\n\n{error}\n", file=sys.stderr)
+    while True:
+        try:
+            choice = input("What now? (e) edit again, (x) exit without saving [e]: ")
+        except EOFError:
+            return False
+        choice = choice.strip().lower()
+        if choice in ("", "e", "edit"):
+            return True
+        if choice in ("x", "exit"):
+            return False
+        print("Please choose 'e' or 'x'.", file=sys.stderr)
 
 
 def _state_service() -> NetworkStateService:

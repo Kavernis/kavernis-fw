@@ -64,6 +64,16 @@ def test_bridge_pipeline() -> None:
     }
 
 
+def test_bridge_member_with_omitted_address_families_is_unaddressed() -> None:
+    data = configuration()
+    data["interfaces"][0].pop("ipv4")
+    data["interfaces"][0].pop("ipv6")
+    config = InterfacesConfig.model_validate(data)
+
+    assert config.interfaces[0].ipv4.mode.value == "disabled"
+    assert config.interfaces[0].ipv6.mode.value == "disabled"
+
+
 def test_bridge_generation_is_order_independent() -> None:
     data = configuration()
     first = plan_interfaces(InterfacesConfig.model_validate(data))
@@ -201,7 +211,7 @@ def test_reject_malformed_bridge_netdev(content: str) -> None:
 
 
 def test_load_bridge_example() -> None:
-    config = load_interfaces(Path("configs/examples/interfaces-bridge.yml"))
+    config = load_interfaces(Path("configs/examples/interfaces-bridge.yaml"))
     assert config.interfaces[2].bridge is not None
     assert len(plan_interfaces(config).files) == 4
 

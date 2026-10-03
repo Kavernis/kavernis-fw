@@ -7,9 +7,10 @@ import pytest
 from kavernis.core.network import (
     DesiredStateChangedError,
     EditorFailedError,
-    EditValidationError,
     NetworkStatePaths,
     NetworkStateService,
+    load_network,
+    plan_network,
 )
 from kavernis.state.lock import LockUnavailableError, network_lock
 
@@ -86,11 +87,116 @@ def test_editor_failure_does_not_modify_live_file(tmp_path: Path) -> None:
     with pytest.raises(EditorFailedError, match="editor exited with status 7"):
         state_service.edit_resource("routes", lambda path: 7)
     assert state_service.paths.routes_path.read_bytes() == original
+    assert not list((tmp_path / "etc").glob(".kavernis-routes-*.yaml"))
     with state_service.network_write_transaction():
         pass
 
 
-def test_invalid_edit_keeps_live_file_and_retains_candidate(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("edited", "invalid_other"),
+    [
+        ("interfaces", "routes.yaml"),
+        ("interfaces", "gateways.yaml"),
+        ("routes", "interfaces.yaml"),
+        ("gateways", "routes.yaml"),
+    ],
+)
+def test_valid_resource_edit_ignores_invalid_other_resource(
+    tmp_path: Path, edited: str, invalid_other: str
+) -> None:
+    state_service = service(tmp_path)
+    desired = tmp_path / "etc"
+    write_desired(desired)
+    (desired / invalid_other).write_text("not: [valid")
+
+    assert state_service.edit_resource(edited, append_comment)
+    assert "# edited" in (desired / f"{edited}.yaml").read_text()
+
+
+@pytest.mark.parametrize(
+    ("resource", "contents"),
+    [
+        (
+            "gateways",
+            b"version: 1\ngateways:\n  - id: missing\n    name: Missing\n"
+            b"    interface: absent\n",
+        ),
+        (
+            "routes",
+            b"version: 1\nroutes:\n  - id: missing\n    network: 10.0.0.0/24\n"
+            b"    gateway: absent\n",
+        ),
+    ],
+)
+def test_cross_resource_references_can_be_saved_during_edit(
+    tmp_path: Path, resource: str, contents: bytes
+) -> None:
+    state_service = service(tmp_path)
+    write_desired(tmp_path / "etc")
+
+    with state_service.network_write_transaction():
+        state_service.replace_desired_resource(
+            resource, contents, state_service.desired_fingerprint()
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource", "invalid"),
+    [
+        ("interfaces", "version: 1\ninterfaces: []\n"),
+        ("gateways", "version: 1\ngateways: [\n"),
+        ("routes", "version: 2\nroutes: []\n"),
+    ],
+)
+def test_invalid_resource_edit_is_not_saved(
+    tmp_path: Path, resource: str, invalid: str
+) -> None:
+    state_service = service(tmp_path)
+    write_desired(tmp_path / "etc")
+    path = tmp_path / "etc" / f"{resource}.yaml"
+    original = path.read_bytes()
+
+    def invalidate(path: Path) -> int:
+        path.write_text(invalid)
+        return 0
+
+    assert not state_service.edit_resource(resource, invalidate)
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob(f".kavernis-{resource}-*.yaml"))
+    with state_service.network_write_transaction():
+        pass
+
+
+def test_invalid_edit_reuses_candidate_then_saves_corrected_content(
+    tmp_path: Path,
+) -> None:
+    state_service = service(tmp_path)
+    write_desired(tmp_path / "etc")
+    candidates: list[Path] = []
+
+    def edit(path: Path) -> int:
+        candidates.append(path)
+        if len(candidates) == 1:
+            path.write_text("routes: [\n")
+        else:
+            assert path.read_text() == "routes: [\n"
+            path.write_text("version: 1\nroutes: []\n# corrected\n")
+        return 0
+
+    errors: list[str] = []
+    assert state_service.edit_resource(
+        "routes", edit, lambda error: errors.append(str(error)) or True
+    )
+    assert len(candidates) == 2
+    assert candidates[0] == candidates[1]
+    assert errors
+    assert "# corrected" in state_service.paths.routes_path.read_text()
+    assert not candidates[0].exists()
+
+
+def test_invalid_edit_abort_cleans_up_candidate_and_leaves_live_file(
+    tmp_path: Path,
+) -> None:
     state_service = service(tmp_path)
     write_desired(tmp_path / "etc")
     original = state_service.paths.routes_path.read_bytes()
@@ -99,13 +205,9 @@ def test_invalid_edit_keeps_live_file_and_retains_candidate(tmp_path: Path) -> N
         path.write_text("routes: [\n")
         return 0
 
-    with pytest.raises(EditValidationError) as raised:
-        state_service.edit_resource("routes", invalidate)
+    assert not state_service.edit_resource("routes", invalidate, lambda _: False)
     assert state_service.paths.routes_path.read_bytes() == original
-    assert raised.value.candidate_path.exists()
-    raised.value.candidate_path.unlink()
-    with state_service.network_write_transaction():
-        pass
+    assert not list((tmp_path / "etc").glob(".kavernis-routes-*.yaml"))
 
 
 @pytest.mark.parametrize("changed", ("interfaces.yaml", "gateways.yaml", "routes.yaml"))
@@ -130,6 +232,67 @@ def test_external_change_to_any_network_file_aborts_edit(
         assert routes_after == original_routes + b"# external\n"
     else:
         assert routes_after == original_routes
+    assert not list(desired.glob(".kavernis-routes-*.yaml"))
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "error"),
+    [
+        (
+            "gateways.yaml",
+            "version: 1\ngateways:\n  - id: bad\n    name: Bad\n"
+            "    interface: absent\n",
+            "does not exist",
+        ),
+        (
+            "routes.yaml",
+            "version: 1\nroutes:\n  - id: bad\n    network: 10.0.0.0/24\n"
+            "    gateway: absent\n",
+            "does not exist",
+        ),
+        (
+            "routes.yaml",
+            "version: 1\nroutes:\n  - id: bad\n    network: ::/0\n    gateway: local\n",
+            "family",
+        ),
+        (
+            "gateways.yaml",
+            "version: 1\ngateways:\n  - id: local\n    name: Local\n"
+            "    interface: lan\n    address: 10.0.0.1\n",
+            "onlink: true",
+        ),
+    ],
+)
+def test_plan_network_keeps_cross_resource_validation(
+    tmp_path: Path, filename: str, contents: str, error: str
+) -> None:
+    state_service = service(tmp_path)
+    desired = tmp_path / "etc"
+    write_desired(desired)
+    if filename == "routes.yaml" and "gateway: local" in contents:
+        (desired / "gateways.yaml").write_text(
+            "version: 1\ngateways:\n  - id: local\n    name: Local\n"
+            "    interface: lan\n    address: 192.168.10.254\n"
+        )
+    (desired / filename).write_text(contents)
+
+    with pytest.raises(ValueError, match=error):
+        plan_network(load_network(state_service.paths))
+
+
+def test_apply_runs_complete_network_validation_before_native_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_service = service(tmp_path)
+    desired = tmp_path / "etc"
+    write_desired(desired)
+    (desired / "gateways.yaml").write_text(
+        "version: 1\ngateways:\n  - id: bad\n    name: Bad\n    interface: absent\n"
+    )
+    monkeypatch.setattr("kavernis.core.network.apply", lambda *_: pytest.fail())
+
+    with pytest.raises(ValueError, match="does not exist"):
+        state_service.apply()
 
 
 def test_fingerprint_covers_every_network_desired_file(tmp_path: Path) -> None:
@@ -175,3 +338,45 @@ def test_network_lock_rejects_another_process(tmp_path: Path) -> None:
         process.join(timeout=5)
     assert process.exitcode == 0
     assert result.get(timeout=1)
+
+
+def test_retry_keeps_network_lock_for_entire_edit_transaction(tmp_path: Path) -> None:
+    state_service = service(tmp_path)
+    write_desired(tmp_path / "etc")
+    context = multiprocessing.get_context("fork")
+    result = context.Queue()
+
+    def invalidate(path: Path) -> int:
+        path.write_text("routes: [\n")
+        return 0
+
+    def abort_while_locked(_: object) -> bool:
+        process = context.Process(
+            target=_try_network_lock,
+            args=(str(state_service.paths.lock_path), result),
+        )
+        process.start()
+        process.join(timeout=5)
+        assert process.exitcode == 0
+        assert result.get(timeout=1)
+        return False
+
+    assert not state_service.edit_resource("routes", invalidate, abort_while_locked)
+    with state_service.network_write_transaction():
+        pass
+
+
+def test_keyboard_interrupt_cleans_up_candidate_and_releases_lock(
+    tmp_path: Path,
+) -> None:
+    state_service = service(tmp_path)
+    write_desired(tmp_path / "etc")
+
+    def interrupt(_: Path) -> int:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        state_service.edit_resource("routes", interrupt)
+    assert not list((tmp_path / "etc").glob(".kavernis-routes-*.yaml"))
+    with state_service.network_write_transaction():
+        pass

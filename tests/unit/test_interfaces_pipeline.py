@@ -93,6 +93,25 @@ def test_plan_interfaces_disables_ipv6_router_advertisements() -> None:
     )
 
 
+def test_omitted_address_families_render_like_explicit_disabled_modes() -> None:
+    base = {"id": "isolated", "name": "Isolated", "device": "eth2"}
+    omitted = InterfacesConfig.model_validate({"version": 1, "interfaces": [base]})
+    explicit = InterfacesConfig.model_validate(
+        {
+            "version": 1,
+            "interfaces": [
+                {
+                    **base,
+                    "ipv4": {"mode": "disabled"},
+                    "ipv6": {"mode": "disabled"},
+                }
+            ],
+        }
+    )
+
+    assert plan_interfaces(omitted) == plan_interfaces(explicit)
+
+
 def test_reject_unsafe_generated_candidate() -> None:
     candidate = NetworkdConfiguration(
         files={"../outside.network": "[Match]\n[Network]\n"}

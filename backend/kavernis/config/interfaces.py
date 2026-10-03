@@ -98,8 +98,15 @@ class InterfaceConfig(BaseModel):
     id: str
     name: str
     device: str
-    ipv4: IPv4Config
-    ipv6: IPv6Config
+    # Address families omitted from desired YAML are deliberately modeled as
+    # disabled, rather than as ``None``.  This keeps bridge/VLAN validation and
+    # backend rendering on the same explicit addressing model.
+    ipv4: IPv4Config = Field(
+        default_factory=lambda: IPv4Config(mode=IPv4Mode.DISABLED)
+    )
+    ipv6: IPv6Config = Field(
+        default_factory=lambda: IPv6Config(mode=IPv6Mode.DISABLED)
+    )
     vlan: VLANConfig | None = None
     bridge: BridgeConfig | None = None
 

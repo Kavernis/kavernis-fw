@@ -43,14 +43,6 @@ class DesiredStateChangedError(RuntimeError):
     """Raised when an edit would overwrite an externally changed desired state."""
 
 
-class EditValidationError(ConfigurationError):
-    """A validated edit failed and its temporary candidate was retained."""
-
-    def __init__(self, message: str, candidate_path: Path) -> None:
-        super().__init__(f"{message}\nEdited candidate retained at: {candidate_path}")
-        self.candidate_path = candidate_path
-
-
 class EditorFailedError(RuntimeError):
     """Raised when an editor exits unsuccessfully."""
 
@@ -127,14 +119,20 @@ class NetworkStateService:
         resource: str,
         contents: bytes,
         baseline: dict[str, str],
-    ) -> NetworkDesiredState:
+    ) -> None:
         """Validate and atomically replace one resource inside a write transaction.
 
         The caller must own ``network_write_transaction``.  Checking all three
         fingerprints makes the operation suitable for future API optimistic
         concurrency without treating generated artifact hashes as revisions.
+
+        The network lock and optimistic-concurrency transaction deliberately
+        cover all three desired-state files.  Validation here deliberately
+        covers only ``resource``: cross-resource resolution belongs to
+        ``plan_network`` and ``apply``.
         """
         filename = _resource_filename(resource)
+        _validate_desired_resource(resource, contents)
         if self.desired_fingerprint() != baseline:
             raise DesiredStateChangedError(
                 "Network desired state changed externally while editing.\n\n"
@@ -142,27 +140,22 @@ class NetworkStateService:
                 "overwrite concurrent changes.\n\nReload the current configuration "
                 "and retry."
             )
-        files = {
-            candidate_filename: path.read_bytes()
-            for candidate_filename, path in self._desired_paths().items()
-        }
-        files[filename] = contents
-        desired = _desired_from_files(files, "edited network configuration")
-        # Resolution is deliberately the same cross-resource validation used by plan.
-        plan_network(desired)
         rendered = _with_desired_header(resource, contents)
         _write_desired_atomically(self._desired_paths()[filename], rendered)
-        files[filename] = rendered
-        return _desired_from_files(files, "edited network configuration")
 
     def edit_resource(
-        self, resource: str, invoke_editor: Callable[[Path], int]
+        self,
+        resource: str,
+        invoke_editor: Callable[[Path], int],
+        retry_invalid: Callable[[ConfigurationError], bool] | None = None,
     ) -> bool:
         """Edit one desired YAML resource safely; return whether it changed.
 
-        The editor callback is intentionally injected so CLI interaction remains
-        testable while the locking, validation, fingerprint, and write mechanics
-        stay in Core.
+        Core retains ownership of locking, candidate lifecycle, resource
+        validation, fingerprints, and atomic replacement.  The optional retry
+        callback lets the CLI implement a visudo-like correction prompt without
+        placing interactive input in business logic.  It receives a validation
+        error and returns whether the same candidate should be edited again.
         """
         filename = _resource_filename(resource)
         with self.network_write_transaction():
@@ -175,34 +168,31 @@ class NetworkStateService:
                 dir=self._desired_paths()[filename].parent,
             )
             candidate_path = Path(temporary_name)
-            preserve_candidate = False
             try:
                 with os.fdopen(descriptor, "wb") as temporary:
                     temporary.write(editable_original)
                     temporary.flush()
                     os.fsync(temporary.fileno())
-                editor_status = invoke_editor(candidate_path)
-                if editor_status != 0:
-                    raise EditorFailedError(
-                        "editor exited with status "
-                        f"{editor_status}; desired state was unchanged"
-                    )
-                contents = candidate_path.read_bytes()
-                if contents == editable_original:
-                    return False
-                try:
-                    self.replace_desired_resource(resource, contents, baseline)
-                except (ConfigurationError, ValueError) as error:
-                    raise EditValidationError(str(error), candidate_path) from error
-                except DesiredStateChangedError:
-                    raise
-                return True
-            except (EditValidationError, DesiredStateChangedError):
-                # Preserve substantial user input for correction or recovery.
-                preserve_candidate = True
-                raise
+                while True:
+                    editor_status = invoke_editor(candidate_path)
+                    if editor_status != 0:
+                        raise EditorFailedError(
+                            "editor exited with status "
+                            f"{editor_status}; desired state was unchanged"
+                        )
+                    contents = candidate_path.read_bytes()
+                    if contents == editable_original:
+                        return False
+                    try:
+                        self.replace_desired_resource(resource, contents, baseline)
+                    except ConfigurationError as error:
+                        if retry_invalid is None or not retry_invalid(error):
+                            return False
+                        # Reopen this exact candidate; do not recopy live state.
+                        continue
+                    return True
             finally:
-                if candidate_path.exists() and not preserve_candidate:
+                if candidate_path.exists():
                     candidate_path.unlink()
 
     def apply(
@@ -333,6 +323,20 @@ def _desired_from_files(files: dict[str, bytes], source: str) -> NetworkDesiredS
         routes=load_routes_contents(files["routes.yaml"].decode(), source),
         files=files,
     )
+
+
+def _validate_desired_resource(resource: str, contents: bytes) -> None:
+    """Run schema/model validation that belongs to one desired-state document."""
+    source = f"edited {resource} configuration"
+    text = contents.decode("utf-8")
+    if resource == "interfaces":
+        load_interfaces_contents(text, source)
+    elif resource == "gateways":
+        load_gateways_contents(text, source)
+    elif resource == "routes":
+        load_routes_contents(text, source)
+    else:  # Keep this guard for callers that bypass _resource_filename.
+        raise ValueError(f"unsupported network resource: {resource}")
 
 
 def _write_desired_atomically(path: Path, contents: bytes) -> None:

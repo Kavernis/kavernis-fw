@@ -95,3 +95,27 @@ def test_editor_fallback_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> No
 def test_unknown_edit_resource_is_rejected() -> None:
     with pytest.raises(SystemExit, match="2"):
         cli.main(["edit", "network"])
+
+
+def test_edit_retries_invalid_candidate_in_same_cli_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    write_network_config(tmp_path)
+    configure_paths(monkeypatch, tmp_path)
+    candidates: list[Path] = []
+
+    def editor(path: Path) -> int:
+        candidates.append(path)
+        if len(candidates) == 1:
+            path.write_text("routes: [\n")
+        else:
+            assert path.read_text() == "routes: [\n"
+            path.write_text("version: 1\nroutes: []\n")
+        return 0
+
+    monkeypatch.setattr(cli, "_invoke_editor", editor)
+    monkeypatch.setattr("builtins.input", lambda _: "e")
+
+    assert cli.main(["edit", "routes"]) == 0
+    assert candidates[0] == candidates[1]
+    assert "Configuration is invalid:" in capsys.readouterr().err
