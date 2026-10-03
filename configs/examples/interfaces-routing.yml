@@ -1,0 +1,18 @@
+version: 1
+
+interfaces:
+  - id: wan
+    name: WAN
+    device: eth0
+    ipv4: {mode: static, address: 192.168.0.1/24}
+    ipv6: {mode: disabled}
+  - id: servers
+    name: Servers
+    device: eth1
+    ipv4: {mode: static, address: 192.168.40.254/24}
+    ipv6: {mode: static, address: 2001:db8:40::1/64}
+  - id: vpn0
+    name: VPN
+    device: wg0
+    ipv4: {mode: static, address: 10.50.0.1/24}
+    ipv6: {mode: disabled}

@@ -22,8 +22,7 @@ def test_network_template_renders_resolved_context() -> None:
     )
 
     assert content == (
-        "[Match]\nName=eth1\n\n[Network]\nAddress=192.0.2.1/24\n"
-        "IPv6AcceptRA=no\n"
+        "[Match]\nName=eth1\n\n[Network]\nAddress=192.0.2.1/24\nIPv6AcceptRA=no\n"
     )
 
 

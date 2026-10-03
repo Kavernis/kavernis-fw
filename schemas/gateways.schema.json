@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kavernis.example/schemas/gateways.schema.json",
+  "title": "Kavernis gateways configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "gateways"],
+  "properties": {
+    "version": {"const": 1},
+    "gateways": {"type": "array", "items": {"$ref": "#/$defs/gateway"}}
+  },
+  "$defs": {
+    "gateway": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "name", "interface"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "name": {"type": "string", "minLength": 1},
+        "interface": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "address": {"type": "string", "format": "ip"},
+        "onlink": {"type": "boolean", "default": false},
+        "description": {"type": "string", "minLength": 1}
+      },
+      "allOf": [{"not": {"properties": {"onlink": {"const": true}}, "required": ["onlink"], "not": {"required": ["address"]}}}]
+    }
+  }
+}

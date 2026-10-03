@@ -7,18 +7,20 @@ from pathlib import Path
 
 from kavernis.backends.networkd import NetworkdApplyError, NetworkdConfiguration
 from kavernis.config.errors import ConfigurationError
-from kavernis.config.loader import load_interfaces
-from kavernis.core.interfaces import (
-    InterfacesStatePaths,
-    InterfacesStateService,
-    InterfacesStatus,
-    apply_interfaces,
-    plan_interfaces,
+from kavernis.core.network import (
+    NETWORK_DOMAIN,
+    NetworkStatePaths,
+    NetworkStateService,
+    NetworkStatus,
+    load_network,
+    plan_network,
 )
 from kavernis.state.history import HistoryError
 from kavernis.state.sqlite import StateStoreError
 
 INTERFACES_PATH = "/etc/kavernis/interfaces.yaml"
+GATEWAYS_PATH = "/etc/kavernis/gateways.yaml"
+ROUTES_PATH = "/etc/kavernis/routes.yaml"
 HISTORY_PATH = "/var/lib/kavernis/history"
 STATE_DATABASE_PATH = "/var/lib/kavernis/state.db"
 NETWORKD_PATH = "/etc/systemd/network"
@@ -36,14 +38,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
         ("history", "show desired-state revision history"),
     ):
         command = action.add_parser(name, help=help_text)
-        command.add_argument("resource", choices=("interfaces",))
+        command.add_argument("resource", choices=("network",))
     diff_command = action.add_parser("diff", help="show desired-state differences")
-    diff_command.add_argument("resource", choices=("interfaces",))
+    diff_command.add_argument("resource", choices=("network",))
     diff_command.add_argument("revision", nargs="?")
     rollback_command = action.add_parser(
         "rollback", help="restore and apply a revision"
     )
-    rollback_command.add_argument("resource", choices=("interfaces",))
+    rollback_command.add_argument("resource", choices=("network",))
     rollback_command.add_argument("revision")
 
     parsed = parser.parse_args(arguments)
@@ -63,27 +65,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 f"{len(candidate.files)} systemd-networkd file(s)."
             )
         else:
-            config = load_interfaces(INTERFACES_PATH)
+            desired = load_network(service.paths)
             if parsed.action == "plan":
-                _print_candidate(plan_interfaces(config))
+                _print_candidate(plan_network(desired))
             elif parsed.action == "apply":
-                # Keep this stable one-argument public seam for integrations.
-                candidate = apply_interfaces(config)
+                candidate = service.apply(desired)
                 print(f"Applied {len(candidate.files)} systemd-networkd file(s).")
             else:
-                desired_contents = Path(INTERFACES_PATH).read_bytes()
                 if parsed.action == "status":
-                    _print_status(service.status(desired_contents))
+                    _print_status(service.status(desired.files))
                 else:
-                    applied = service.store.get_domain_state("interfaces")
+                    applied = service.store.get_domain_state(NETWORK_DOMAIN)
                     revision = parsed.revision or (
                         applied.revision if applied else None
                     )
                     if revision is None:
                         raise ValueError(
-                            "interfaces has not yet been successfully applied"
+                            "network has not yet been successfully applied"
                         )
-                    print(service.diff(desired_contents, revision), end="")
+                    print(service.diff(desired.files, revision), end="")
     except (
         ConfigurationError,
         HistoryError,
@@ -106,11 +106,13 @@ def _print_candidate(candidate: NetworkdConfiguration) -> None:
         print(content, end="")
 
 
-def _state_service() -> InterfacesStateService:
+def _state_service() -> NetworkStateService:
     """Construct dependencies at the CLI composition boundary."""
-    return InterfacesStateService(
-        InterfacesStatePaths(
-            desired_path=Path(INTERFACES_PATH),
+    return NetworkStateService(
+        NetworkStatePaths(
+            interfaces_path=Path(INTERFACES_PATH),
+            gateways_path=Path(GATEWAYS_PATH),
+            routes_path=Path(ROUTES_PATH),
             history_path=Path(HISTORY_PATH),
             database_path=Path(STATE_DATABASE_PATH),
             networkd_path=Path(NETWORKD_PATH),
@@ -119,7 +121,7 @@ def _state_service() -> InterfacesStateService:
     )
 
 
-def _print_status(status: InterfacesStatus) -> None:
+def _print_status(status: NetworkStatus) -> None:
     """Print Kavernis concepts rather than state-store implementation details."""
     print(f"Status: {status.kind.value}")
     print(f"Desired revision: {status.desired_revision or 'unrecorded desired state'}")

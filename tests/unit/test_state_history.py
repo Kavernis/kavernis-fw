@@ -10,7 +10,7 @@ def test_history_snapshots_only_changed_desired_state_and_reads_revisions(
     history = DesiredStateHistory(tmp_path / "history")
     first_contents = b"version: 1\ninterfaces: []\n"
     first = history.snapshot(
-        {"interfaces.yaml": first_contents}, "apply interfaces desired state"
+        {"interfaces.yaml": first_contents}, "apply network desired state"
     )
 
     assert (tmp_path / "history" / ".git").is_dir()
@@ -18,7 +18,7 @@ def test_history_snapshots_only_changed_desired_state_and_reads_revisions(
 
     second_contents = b"version: 1\ninterfaces: [changed]\n"
     second = history.snapshot(
-        {"interfaces.yaml": second_contents}, "apply interfaces desired state"
+        {"interfaces.yaml": second_contents}, "apply network desired state"
     )
 
     assert second != first

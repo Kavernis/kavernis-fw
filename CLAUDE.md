@@ -154,6 +154,8 @@ Configuration SHOULD remain separated by domain, for example:
 
 ```text id="0d44kp"
 interfaces.yaml
+gateways.yaml
+routes.yaml
 firewall.yaml
 dhcp.yaml
 dns.yaml
