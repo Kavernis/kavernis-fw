@@ -19,9 +19,22 @@ class IPv6AddressMode(Enum):
 
 
 @dataclass(frozen=True)
+class DHCPv4Settings:
+    """Resolved, backend-independent DHCPv4 client policy."""
+
+    use_hostname: bool
+    send_hostname: bool
+    use_dns: bool
+    use_routes: bool
+    use_ntp: bool
+    route_metric: int | None
+
+
+@dataclass(frozen=True)
 class IPv4Settings:
     mode: IPv4AddressMode
     address: IPv4Interface | None = None
+    dhcp: DHCPv4Settings | None = None
 
 
 @dataclass(frozen=True)

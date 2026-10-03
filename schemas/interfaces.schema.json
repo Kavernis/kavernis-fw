@@ -17,7 +17,7 @@
     "interface": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "name", "device", "ipv4", "ipv6"],
+      "required": ["id", "name", "device"],
       "allOf": [{
         "if": {"anyOf": [
           {"required": ["vlan"], "properties": {"vlan": {"type": "object"}}},
@@ -66,8 +66,21 @@
     "ipv4": {
       "oneOf": [
         {"type": "object", "additionalProperties": false, "required": ["mode", "address"], "properties": {"mode": {"const": "static"}, "address": {"type": "string"}}},
-        {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"enum": ["dhcp", "disabled"]}}}
+        {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"const": "dhcp"}, "dhcp": {"$ref": "#/$defs/dhcpv4"}}},
+        {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"const": "disabled"}}}
       ]
+    },
+    "dhcpv4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "use_hostname": {"type": "boolean", "default": false},
+        "send_hostname": {"type": "boolean", "default": true},
+        "use_dns": {"type": "boolean", "default": true},
+        "use_routes": {"type": "boolean", "default": true},
+        "use_ntp": {"type": "boolean", "default": true},
+        "route_metric": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      }
     },
     "ipv6": {
       "oneOf": [

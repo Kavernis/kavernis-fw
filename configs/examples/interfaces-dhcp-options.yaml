@@ -1,0 +1,11 @@
+version: 1
+
+interfaces:
+  - id: wan
+    name: WAN
+    device: eth0
+    ipv4:
+      mode: dhcp
+      dhcp:
+        use_dns: false
+        route_metric: 200

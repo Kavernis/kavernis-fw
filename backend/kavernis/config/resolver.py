@@ -6,6 +6,7 @@ from kavernis.config.interfaces import InterfaceConfig, InterfacesConfig
 from kavernis.config.routes import RoutesConfig
 from kavernis.models.interface import (
     BridgeSettings,
+    DHCPv4Settings,
     IPv4AddressMode,
     IPv4Settings,
     IPv6AddressMode,
@@ -34,6 +35,18 @@ def resolve_interface(config: InterfaceConfig) -> NetworkInterface:
         ipv4=IPv4Settings(
             mode=IPv4AddressMode(config.ipv4.mode.value),
             address=config.ipv4.address,
+            dhcp=(
+                DHCPv4Settings(
+                    use_hostname=config.ipv4.dhcp.use_hostname,
+                    send_hostname=config.ipv4.dhcp.send_hostname,
+                    use_dns=config.ipv4.dhcp.use_dns,
+                    use_routes=config.ipv4.dhcp.use_routes,
+                    use_ntp=config.ipv4.dhcp.use_ntp,
+                    route_metric=config.ipv4.dhcp.route_metric,
+                )
+                if config.ipv4.mode.value == "dhcp"
+                else None
+            ),
         ),
         ipv6=IPv6Settings(
             mode=IPv6AddressMode(config.ipv6.mode.value),

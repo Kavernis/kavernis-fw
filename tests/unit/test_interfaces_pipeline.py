@@ -1,6 +1,7 @@
 import os
 import stat
 import subprocess
+from ipaddress import IPv4Network
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,14 @@ from kavernis.config.interfaces import InterfacesConfig
 from kavernis.config.resolver import resolve_interfaces
 from kavernis.core.interfaces import plan_interfaces
 from kavernis.models.interface import (
+    DHCPv4Settings,
     IPv4AddressMode,
     IPv4Settings,
     IPv6AddressMode,
     IPv6Settings,
     NetworkInterface,
 )
+from kavernis.models.routing import ResolvedRoute
 
 
 def configuration() -> InterfacesConfig:
@@ -68,7 +71,8 @@ def test_plan_interfaces_generates_deterministic_networkd_files() -> None:
         "[Match]\nName=eth1\n\n[Network]\nAddress=192.168.10.254/24\nIPv6AcceptRA=yes\n"
     )
     assert candidate.files["10-kavernis-wan.network"] == (
-        "[Match]\nName=eth0\n\n[Network]\nDHCP=yes\n"
+        "[Match]\nName=eth0\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\n"
+        "UseHostname=no\nSendHostname=yes\nUseDNS=yes\nUseRoutes=yes\nUseNTP=yes\n"
     )
 
 
@@ -112,6 +116,102 @@ def test_omitted_address_families_render_like_explicit_disabled_modes() -> None:
     )
 
     assert plan_interfaces(omitted) == plan_interfaces(explicit)
+
+
+def test_dhcpv4_defaults_propagate_to_domain_and_networkd() -> None:
+    config = InterfacesConfig.model_validate(
+        {
+            "version": 1,
+            "interfaces": [
+                {"id": "wan", "name": "WAN", "device": "eth0", "ipv4": {"mode": "dhcp"}}
+            ],
+        }
+    )
+
+    interface = resolve_interfaces(config)[0]
+    assert interface.ipv4.dhcp == DHCPv4Settings(False, True, True, True, True, None)
+    content = plan_interfaces(config).files["10-kavernis-wan.network"]
+    assert "DHCP=ipv4\n" in content
+    assert "[DHCPv4]\nUseHostname=no\nSendHostname=yes\nUseDNS=yes\n" in content
+    assert "UseRoutes=yes\nUseNTP=yes\n" in content
+    assert "RouteMetric=" not in content
+
+
+def test_dhcpv4_overrides_render_explicit_native_policy() -> None:
+    config = InterfacesConfig.model_validate(
+        {
+            "version": 1,
+            "interfaces": [
+                {
+                    "id": "wan",
+                    "name": "WAN",
+                    "device": "eth0",
+                    "ipv4": {
+                        "mode": "dhcp",
+                        "dhcp": {
+                            "use_hostname": True,
+                            "send_hostname": False,
+                            "use_dns": False,
+                            "use_routes": False,
+                            "use_ntp": False,
+                            "route_metric": 200,
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+    content = plan_interfaces(config).files["10-kavernis-wan.network"]
+    assert "UseHostname=yes\nSendHostname=no\nUseDNS=no\n" in content
+    assert "UseRoutes=no\nUseNTP=no\nRouteMetric=200\n" in content
+
+
+def test_explicit_and_omitted_dhcpv4_defaults_are_deterministic() -> None:
+    interface = {"id": "wan", "name": "WAN", "device": "eth0"}
+    omitted = InterfacesConfig.model_validate(
+        {"version": 1, "interfaces": [{**interface, "ipv4": {"mode": "dhcp"}}]}
+    )
+    explicit = InterfacesConfig.model_validate(
+        {
+            "version": 1,
+            "interfaces": [
+                {
+                    **interface,
+                    "ipv4": {
+                        "mode": "dhcp",
+                        "dhcp": {
+                            "use_hostname": False,
+                            "send_hostname": True,
+                            "use_dns": True,
+                            "use_routes": True,
+                            "use_ntp": True,
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+    assert plan_interfaces(omitted) == plan_interfaces(explicit)
+
+
+def test_dhcpv4_use_routes_does_not_suppress_static_routes() -> None:
+    interface = NetworkInterface(
+        id="wan",
+        name="WAN",
+        device="eth0",
+        ipv4=IPv4Settings(
+            mode=IPv4AddressMode.DHCP,
+            dhcp=DHCPv4Settings(False, True, True, False, True, None),
+        ),
+        ipv6=IPv6Settings(mode=IPv6AddressMode.DISABLED),
+        routes=(ResolvedRoute("private", IPv4Network("10.0.0.0/8"), None, False),),
+    )
+
+    content = generate([interface]).files["10-kavernis-wan.network"]
+    assert "UseRoutes=no\n" in content
+    assert "[Route]\nDestination=10.0.0.0/8\n" in content
 
 
 def test_reject_unsafe_generated_candidate() -> None:
