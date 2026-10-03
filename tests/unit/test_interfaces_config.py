@@ -100,3 +100,75 @@ def test_missing_address_families_default_to_disabled() -> None:
 
     assert config.interfaces[0].ipv4.mode is IPv4Mode.DISABLED
     assert config.interfaces[0].ipv6.mode is IPv6Mode.DISABLED
+
+
+def test_dhcpv4_options_default_without_dhcp_subsection() -> None:
+    data = valid_configuration()
+    data["interfaces"][0]["ipv4"] = {"mode": "dhcp"}  # type: ignore[index]
+
+    dhcp = InterfacesConfig.model_validate(data).interfaces[0].ipv4.dhcp
+
+    assert dhcp.use_hostname is False
+    assert dhcp.send_hostname is True
+    assert dhcp.use_dns is True
+    assert dhcp.use_routes is True
+    assert dhcp.use_ntp is True
+    assert dhcp.route_metric is None
+
+
+def test_dhcpv4_options_allow_partial_and_complete_overrides() -> None:
+    data = valid_configuration()
+    data["interfaces"][0]["ipv4"] = {  # type: ignore[index]
+        "mode": "dhcp",
+        "dhcp": {
+            "use_hostname": True,
+            "send_hostname": False,
+            "use_dns": False,
+            "use_routes": False,
+            "use_ntp": False,
+            "route_metric": 200,
+        },
+    }
+
+    dhcp = InterfacesConfig.model_validate(data).interfaces[0].ipv4.dhcp
+
+    assert dhcp.use_hostname is True
+    assert dhcp.send_hostname is False
+    assert dhcp.use_dns is False
+    assert dhcp.use_routes is False
+    assert dhcp.use_ntp is False
+    assert dhcp.route_metric == 200
+
+    data["interfaces"][0]["ipv4"] = {  # type: ignore[index]
+        "mode": "dhcp",
+        "dhcp": {"use_dns": False},
+    }
+    partial = InterfacesConfig.model_validate(data).interfaces[0].ipv4.dhcp
+    assert partial.use_dns is False
+    assert partial.use_hostname is False
+    assert partial.send_hostname is True
+    assert partial.use_routes is True
+    assert partial.use_ntp is True
+    assert partial.route_metric is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "dhcp", "match"),
+    [
+        ("dhcp", {"route_metric": -1}, "route_metric"),
+        ("dhcp", {"route_metric": 4294967296}, "route_metric"),
+        ("static", {"use_dns": False}, "dhcp"),
+        ("disabled", {"use_dns": False}, "dhcp"),
+    ],
+)
+def test_dhcpv4_options_reject_invalid_mode_or_metric(
+    mode: str, dhcp: dict[str, object], match: str
+) -> None:
+    data = valid_configuration()
+    ipv4: dict[str, object] = {"mode": mode, "dhcp": dhcp}
+    if mode == "static":
+        ipv4["address"] = "192.168.10.1/24"
+    data["interfaces"][0]["ipv4"] = ipv4  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match=match):
+        InterfacesConfig.model_validate(data)

@@ -14,6 +14,7 @@ def test_network_template_renders_resolved_context() -> None:
             "device": "eth1",
             "addresses": ("192.0.2.1/24",),
             "dhcp": None,
+            "dhcp_v4": None,
             "ipv6_accept_ra": "no",
             "link_local_addressing": None,
             "vlans": (),

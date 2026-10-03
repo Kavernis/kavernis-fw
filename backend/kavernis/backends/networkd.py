@@ -42,6 +42,7 @@ class NetworkTemplateContext:
     device: str
     addresses: tuple[str, ...]
     dhcp: str | None
+    dhcp_v4: "DHCPv4TemplateContext | None"
     ipv6_accept_ra: str | None
     link_local_addressing: str | None
     vlans: tuple[str, ...]
@@ -56,6 +57,18 @@ class RouteTemplateContext:
     destination: str
     gateway: str | None
     gateway_onlink: str | None
+
+
+@dataclass(frozen=True)
+class DHCPv4TemplateContext:
+    """Explicit native DHCPv4 policy derived from Kavernis domain intent."""
+
+    use_hostname: str
+    send_hostname: str
+    use_dns: str
+    use_routes: str
+    use_ntp: str
+    route_metric: int | None
 
 
 @dataclass(frozen=True)
@@ -368,6 +381,7 @@ def _render_interface(
         ipv6_accept_ra = "no"
 
     dhcp: str | None = None
+    dhcp_v4: DHCPv4TemplateContext | None = None
     if (
         interface.ipv4.mode is IPv4AddressMode.DHCP
         and interface.ipv6.mode is IPv6AddressMode.DHCP6
@@ -378,6 +392,20 @@ def _render_interface(
     elif interface.ipv6.mode is IPv6AddressMode.DHCP6:
         dhcp = "ipv6"
 
+    if interface.ipv4.mode is IPv4AddressMode.DHCP:
+        if interface.ipv4.dhcp is None:
+            raise NetworkdValidationError(
+                f"DHCP IPv4 interface {interface.id} has no DHCPv4 policy"
+            )
+        dhcp_v4 = DHCPv4TemplateContext(
+            use_hostname="yes" if interface.ipv4.dhcp.use_hostname else "no",
+            send_hostname="yes" if interface.ipv4.dhcp.send_hostname else "no",
+            use_dns="yes" if interface.ipv4.dhcp.use_dns else "no",
+            use_routes="yes" if interface.ipv4.dhcp.use_routes else "no",
+            use_ntp="yes" if interface.ipv4.dhcp.use_ntp else "no",
+            route_metric=interface.ipv4.dhcp.route_metric,
+        )
+
     link_local_addressing: str | None = None
     if bridge is not None:
         dhcp = "no"
@@ -387,6 +415,7 @@ def _render_interface(
         device=interface.device,
         addresses=tuple(addresses),
         dhcp=dhcp,
+        dhcp_v4=dhcp_v4,
         ipv6_accept_ra=ipv6_accept_ra,
         link_local_addressing=link_local_addressing,
         vlans=tuple(vlans),

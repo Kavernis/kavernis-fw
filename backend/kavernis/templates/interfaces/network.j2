@@ -8,7 +8,15 @@ Name={{ device }}
 {% endif %}{% if link_local_addressing is not none %}LinkLocalAddressing={{ link_local_addressing }}
 {% endif %}{% for vlan in vlans %}VLAN={{ vlan }}
 {% endfor %}{% if bridge is not none %}Bridge={{ bridge }}
-{% endif %}{% for route in routes|default(()) %}
+{% endif %}{% if dhcp_v4 is not none %}
+[DHCPv4]
+UseHostname={{ dhcp_v4.use_hostname }}
+SendHostname={{ dhcp_v4.send_hostname }}
+UseDNS={{ dhcp_v4.use_dns }}
+UseRoutes={{ dhcp_v4.use_routes }}
+UseNTP={{ dhcp_v4.use_ntp }}
+{% if dhcp_v4.route_metric is not none %}RouteMetric={{ dhcp_v4.route_metric }}
+{% endif %}{% endif %}{% for route in routes|default(()) %}
 [Route]
 Destination={{ route.destination }}
 {% if route.gateway is not none %}Gateway={{ route.gateway }}

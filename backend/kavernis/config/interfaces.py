@@ -25,11 +25,25 @@ class IPv6Mode(StrEnum):
     DISABLED = "disabled"
 
 
+class DHCPv4Config(BaseModel):
+    """Kavernis DHCPv4 policy, resolved independently of networkd defaults."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    use_hostname: bool = Field(default=False, strict=True)
+    send_hostname: bool = Field(default=True, strict=True)
+    use_dns: bool = Field(default=True, strict=True)
+    use_routes: bool = Field(default=True, strict=True)
+    use_ntp: bool = Field(default=True, strict=True)
+    route_metric: int | None = Field(default=None, strict=True, ge=0, le=4294967295)
+
+
 class IPv4Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     mode: IPv4Mode
     address: IPv4Interface | None = None
+    dhcp: DHCPv4Config = Field(default_factory=DHCPv4Config)
 
     @model_validator(mode="after")
     def validate_address_for_mode(self) -> "IPv4Config":
@@ -42,6 +56,11 @@ class IPv4Config(BaseModel):
             raise PydanticCustomError(
                 "address_not_allowed",
                 "ipv4.address is only allowed when ipv4.mode is 'static'",
+            )
+        if self.mode is not IPv4Mode.DHCP and "dhcp" in self.model_fields_set:
+            raise PydanticCustomError(
+                "dhcp_not_allowed",
+                "ipv4.dhcp is only allowed when ipv4.mode is 'dhcp'",
             )
         return self
 

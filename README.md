@@ -148,6 +148,51 @@ means `mode: disabled`, so an unaddressed interface can be written concisely:
   device: eth1
 ```
 
+### DHCPv4 policy
+
+IPv4 DHCP options are optional desired-state overrides. Kavernis resolves and
+renders its own DHCPv4 policy even when the `dhcp` block is omitted:
+
+```yaml
+ipv4:
+  mode: dhcp
+```
+
+The generated systemd-networkd file still contains an explicit `[DHCPv4]`
+section:
+
+| Property | Kavernis default | networkd output |
+| --- | ---: | --- |
+| `use_hostname` | `false` | `UseHostname=no` |
+| `send_hostname` | `true` | `SendHostname=yes` |
+| `use_dns` | `true` | `UseDNS=yes` |
+| `use_routes` | `true` | `UseRoutes=yes` |
+| `use_ntp` | `true` | `UseNTP=yes` |
+| `route_metric` | unset | omitted |
+
+`use_hostname: false` prevents a DHCP server from changing the firewall or
+router hostname. It is deliberately independent from `send_hostname: true`,
+which permits the local hostname to be sent to the DHCP server. Individual
+defaults can be overridden without repeating the rest:
+
+```yaml
+ipv4:
+  mode: dhcp
+  dhcp:
+    use_dns: false
+    route_metric: 200
+```
+
+The `dhcp` subsection is valid only with `ipv4.mode: dhcp`; it is rejected for
+static or disabled IPv4. `use_routes` affects only DHCP-learned routes, never
+Kavernis-declared static routes.
+See [the DHCPv4 override example](configs/examples/interfaces-dhcp-options.yaml).
+
+Kavernis YAML may omit properties that have Kavernis defaults, but generated
+native configuration explicitly encodes Kavernis-defined behavior whenever
+practical. Kavernis does not rely on native-service defaults for behavior it
+owns.
+
 Generated files such as nftables rulesets or systemd-networkd configuration are implementation artifacts and are not the source of truth.
 
 ### Static gateways and routes
