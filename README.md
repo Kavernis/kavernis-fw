@@ -264,6 +264,35 @@ kavernis plan network
 `plan` loads, validates and resolves the YAML, then prints the generated
 `systemd-networkd` files without modifying the host.
 
+### Safely editing desired state
+
+The three network YAML files remain ordinary, human-readable desired state and
+are the authoritative configuration. Direct writes are unsupported: use the
+resource-oriented editor command instead.
+
+```bash
+kavernis edit interfaces
+kavernis edit gateways
+kavernis edit routes
+```
+
+`edit` opens a secure temporary copy using `$VISUAL`, then `$EDITOR`, then
+`nano`. It validates the resource and complete network transaction before
+atomically replacing the live YAML. All network desired-state writes share the
+same `/run/kavernis/network.lock` advisory lock. Kavernis also fingerprints all
+three YAML files with SHA-256 and refuses to overwrite an edit if any file was
+changed externally while the editor was open. The same Core transaction is
+available to future API writers.
+
+Editing only changes desired state; it does not apply configuration or advance
+SQLite applied state. The normal workflow is:
+
+```bash
+kavernis edit routes
+kavernis plan network
+kavernis apply network
+```
+
 ```bash
 kavernis apply network
 ```

@@ -1,8 +1,11 @@
 """Plan, apply, audit, and recover complete network desired state."""
 
 import difflib
+import hashlib
 import os
 import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -15,6 +18,7 @@ from kavernis.backends.networkd import (
     generate,
     inspect_artifact_drift,
 )
+from kavernis.config.errors import ConfigurationError
 from kavernis.config.gateways import GatewaysConfig
 from kavernis.config.interfaces import InterfacesConfig
 from kavernis.config.loader import (
@@ -25,13 +29,30 @@ from kavernis.config.loader import (
 from kavernis.config.resolver import resolve_network
 from kavernis.config.routes import RoutesConfig
 from kavernis.state.history import DesiredStateHistory
-from kavernis.state.lock import state_lock
+from kavernis.state.lock import network_lock
 from kavernis.state.models import ArtifactDrift, HistoryRevision
 from kavernis.state.sqlite import SQLiteStateStore
 from kavernis.state.store import StateStore
 
 NETWORK_DOMAIN = "network"
 DESIRED_FILENAMES = ("interfaces.yaml", "gateways.yaml", "routes.yaml")
+EDITABLE_RESOURCES = ("interfaces", "gateways", "routes")
+
+
+class DesiredStateChangedError(RuntimeError):
+    """Raised when an edit would overwrite an externally changed desired state."""
+
+
+class EditValidationError(ConfigurationError):
+    """A validated edit failed and its temporary candidate was retained."""
+
+    def __init__(self, message: str, candidate_path: Path) -> None:
+        super().__init__(f"{message}\nEdited candidate retained at: {candidate_path}")
+        self.candidate_path = candidate_path
+
+
+class EditorFailedError(RuntimeError):
+    """Raised when an editor exits unsuccessfully."""
 
 
 class NetworkStatusKind(StrEnum):
@@ -67,7 +88,7 @@ class NetworkStatePaths:
     history_path: Path = Path("/var/lib/kavernis/history")
     database_path: Path = Path("/var/lib/kavernis/state.db")
     networkd_path: Path = Path("/etc/systemd/network")
-    lock_path: Path = Path("/var/lib/kavernis/state.lock")
+    lock_path: Path = Path("/run/kavernis/network.lock")
 
 
 class NetworkStateService:
@@ -83,9 +104,115 @@ class NetworkStateService:
         self.history = history or DesiredStateHistory(paths.history_path)
         self.store = store or SQLiteStateStore(paths.database_path)
 
-    def apply(self, desired: NetworkDesiredState) -> NetworkdConfiguration:
-        candidate = plan_network(desired)
-        with state_lock(self.paths.lock_path):
+    @contextmanager
+    def network_write_transaction(self) -> Iterator[None]:
+        """Acquire the reusable network desired-state write transaction lock.
+
+        Callers such as a future HTTP API can use this boundary around loading,
+        validating, and ``replace_desired_resource`` without knowing about
+        ``fcntl`` or the lock-file location.
+        """
+        with network_lock(self.paths.lock_path):
+            yield
+
+    def desired_fingerprint(self) -> dict[str, str]:
+        """Return SHA-256 fingerprints of the actual desired-state bytes."""
+        return {
+            filename: hashlib.sha256(path.read_bytes()).hexdigest()
+            for filename, path in self._desired_paths().items()
+        }
+
+    def replace_desired_resource(
+        self,
+        resource: str,
+        contents: bytes,
+        baseline: dict[str, str],
+    ) -> NetworkDesiredState:
+        """Validate and atomically replace one resource inside a write transaction.
+
+        The caller must own ``network_write_transaction``.  Checking all three
+        fingerprints makes the operation suitable for future API optimistic
+        concurrency without treating generated artifact hashes as revisions.
+        """
+        filename = _resource_filename(resource)
+        if self.desired_fingerprint() != baseline:
+            raise DesiredStateChangedError(
+                "Network desired state changed externally while editing.\n\n"
+                "The edited configuration was not installed because doing so could "
+                "overwrite concurrent changes.\n\nReload the current configuration "
+                "and retry."
+            )
+        files = {
+            candidate_filename: path.read_bytes()
+            for candidate_filename, path in self._desired_paths().items()
+        }
+        files[filename] = contents
+        desired = _desired_from_files(files, "edited network configuration")
+        # Resolution is deliberately the same cross-resource validation used by plan.
+        plan_network(desired)
+        rendered = _with_desired_header(resource, contents)
+        _write_desired_atomically(self._desired_paths()[filename], rendered)
+        files[filename] = rendered
+        return _desired_from_files(files, "edited network configuration")
+
+    def edit_resource(
+        self, resource: str, invoke_editor: Callable[[Path], int]
+    ) -> bool:
+        """Edit one desired YAML resource safely; return whether it changed.
+
+        The editor callback is intentionally injected so CLI interaction remains
+        testable while the locking, validation, fingerprint, and write mechanics
+        stay in Core.
+        """
+        filename = _resource_filename(resource)
+        with self.network_write_transaction():
+            baseline = self.desired_fingerprint()
+            original = self._desired_paths()[filename].read_bytes()
+            editable_original = _with_desired_header(resource, original)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".kavernis-{resource}-",
+                suffix=".yaml",
+                dir=self._desired_paths()[filename].parent,
+            )
+            candidate_path = Path(temporary_name)
+            preserve_candidate = False
+            try:
+                with os.fdopen(descriptor, "wb") as temporary:
+                    temporary.write(editable_original)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                editor_status = invoke_editor(candidate_path)
+                if editor_status != 0:
+                    raise EditorFailedError(
+                        "editor exited with status "
+                        f"{editor_status}; desired state was unchanged"
+                    )
+                contents = candidate_path.read_bytes()
+                if contents == editable_original:
+                    return False
+                try:
+                    self.replace_desired_resource(resource, contents, baseline)
+                except (ConfigurationError, ValueError) as error:
+                    raise EditValidationError(str(error), candidate_path) from error
+                except DesiredStateChangedError:
+                    raise
+                return True
+            except (EditValidationError, DesiredStateChangedError):
+                # Preserve substantial user input for correction or recovery.
+                preserve_candidate = True
+                raise
+            finally:
+                if candidate_path.exists() and not preserve_candidate:
+                    candidate_path.unlink()
+
+    def apply(
+        self, desired: NetworkDesiredState | None = None
+    ) -> NetworkdConfiguration:
+        # ``desired`` remains accepted for compatibility.  Reload under the lock
+        # so the candidate, history snapshot, and native apply use one revision.
+        with self.network_write_transaction():
+            desired = load_network(self.paths)
+            candidate = plan_network(desired)
             revision = self.history.snapshot(
                 desired.files, "apply network desired state"
             )
@@ -148,21 +275,21 @@ class NetworkStateService:
         )
 
     def rollback(self, revision: str) -> NetworkdConfiguration:
-        with state_lock(self.paths.lock_path):
+        with self.network_write_transaction():
             files = {
                 filename: self.history.read_revision(revision, filename)
                 for filename in DESIRED_FILENAMES
             }
             desired = _desired_from_files(files, f"revision {revision}")
             candidate = plan_network(desired)
-            for path, filename in (
-                (self.paths.interfaces_path, "interfaces.yaml"),
-                (self.paths.gateways_path, "gateways.yaml"),
-                (self.paths.routes_path, "routes.yaml"),
-            ):
-                _write_desired_atomically(path, files[filename])
+            written_files = {
+                filename: _with_desired_header(_filename_resource(filename), contents)
+                for filename, contents in files.items()
+            }
+            for filename, path in self._desired_paths().items():
+                _write_desired_atomically(path, written_files[filename])
             new_revision = self.history.snapshot(
-                files, f"rollback network to {revision[:12]}"
+                written_files, f"rollback network to {revision[:12]}"
             )
             try:
                 apply(candidate, self.paths.networkd_path)
@@ -173,6 +300,13 @@ class NetworkStateService:
                 NETWORK_DOMAIN, new_revision, artifact_hashes(candidate)
             )
         return candidate
+
+    def _desired_paths(self) -> dict[str, Path]:
+        return {
+            "interfaces.yaml": self.paths.interfaces_path,
+            "gateways.yaml": self.paths.gateways_path,
+            "routes.yaml": self.paths.routes_path,
+        }
 
 
 def load_network(paths: NetworkStatePaths) -> NetworkDesiredState:
@@ -203,7 +337,8 @@ def _desired_from_files(files: dict[str, bytes], source: str) -> NetworkDesiredS
 
 def _write_desired_atomically(path: Path, contents: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    metadata = path.stat() if path.exists() else None
+    mode = metadata.st_mode & 0o777 if metadata else 0o644
     descriptor, temporary_name = tempfile.mkstemp(prefix=".kavernis-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as temporary:
@@ -211,10 +346,36 @@ def _write_desired_atomically(path: Path, contents: bytes) -> None:
             temporary.flush()
             os.fsync(temporary.fileno())
         os.chmod(temporary_name, mode)
+        if metadata is not None:
+            os.chown(temporary_name, metadata.st_uid, metadata.st_gid)
         os.replace(temporary_name, path)
+        directory_descriptor = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except BaseException:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
         raise
+
+
+def _resource_filename(resource: str) -> str:
+    if resource not in EDITABLE_RESOURCES:
+        raise ValueError(f"unsupported network resource: {resource}")
+    return f"{resource}.yaml"
+
+
+def _filename_resource(filename: str) -> str:
+    return filename.removesuffix(".yaml")
+
+
+def _with_desired_header(resource: str, contents: bytes) -> bytes:
+    header = (
+        "# Kavernis desired-state configuration.\n"
+        "# Direct editing is not supported.\n"
+        f'# Use "kavernis edit {resource}" to modify this file safely.\n\n'
+    ).encode()
+    return contents if contents.startswith(header) else header + contents

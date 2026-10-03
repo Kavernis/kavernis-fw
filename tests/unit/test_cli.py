@@ -44,7 +44,9 @@ def test_apply_network_uses_one_network_transaction(
     candidate = NetworkdConfiguration(files={"10-kavernis-lan.network": "content\n"})
     applied: list[bool] = []
 
-    def apply(_: NetworkStateService, desired: object) -> NetworkdConfiguration:
+    def apply(
+        _: NetworkStateService, desired: object | None = None
+    ) -> NetworkdConfiguration:
         applied.append(True)
         return candidate
 
@@ -58,3 +60,38 @@ def test_apply_network_uses_one_network_transaction(
 def test_interfaces_is_rejected_as_a_cli_resource(action: str) -> None:
     with pytest.raises(SystemExit, match="2"):
         cli.main([action, "interfaces"])
+
+
+@pytest.mark.parametrize("resource", ("interfaces", "gateways", "routes"))
+def test_edit_accepts_network_resources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys, resource: str
+) -> None:
+    write_network_config(tmp_path)
+    configure_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(NetworkStateService, "edit_resource", lambda *_: False)
+
+    assert cli.main(["edit", resource]) == 0
+    assert capsys.readouterr().out == "No changes.\n"
+
+
+def test_visual_precedes_editor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VISUAL", "visual --wait")
+    monkeypatch.setenv("EDITOR", "editor")
+    assert cli._editor_command() == ["visual", "--wait"]
+
+
+def test_editor_is_used_when_visual_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setenv("EDITOR", "editor --wait")
+    assert cli._editor_command() == ["editor", "--wait"]
+
+
+def test_editor_fallback_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    assert cli._editor_command() == ["nano"]
+
+
+def test_unknown_edit_resource_is_rejected() -> None:
+    with pytest.raises(SystemExit, match="2"):
+        cli.main(["edit", "network"])
