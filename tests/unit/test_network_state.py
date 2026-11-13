@@ -8,6 +8,7 @@ from kavernis.core.network import (
     NetworkStatusKind,
     load_network,
 )
+from kavernis.state.models import ApplyOutcomeKind
 from network_helpers import service, write_desired
 
 
@@ -45,7 +46,13 @@ def test_failed_network_apply_keeps_previous_network_revision(
 ) -> None:
     state_service = service(tmp_path)
     write_desired(tmp_path / "etc/network")
-    monkeypatch.setattr(network_core, "apply", lambda candidate, directory: None)
+
+    def install(candidate, directory) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        for filename, content in candidate.files.items():
+            (directory / filename).write_text(content)
+
+    monkeypatch.setattr(network_core, "apply", install)
     state_service.apply()
     previous = state_service.store.get_domain_state(NETWORK_DOMAIN)
     assert previous is not None
@@ -60,6 +67,64 @@ def test_failed_network_apply_keeps_previous_network_revision(
     with pytest.raises(NetworkdApplyError):
         state_service.apply()
     assert state_service.store.get_domain_state(NETWORK_DOMAIN) == previous
+    outcome = state_service.status(load_network(state_service.paths).files).last_outcome
+    assert outcome is not None
+    assert outcome.kind is ApplyOutcomeKind.FAILURE
+    assert outcome.message == "reload failed"
+
+
+def test_status_keeps_failed_apply_visible_when_artifacts_are_in_sync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_service = service(tmp_path)
+    write_desired(tmp_path / "etc/network")
+
+    def install(candidate, directory) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        for filename, content in candidate.files.items():
+            (directory / filename).write_text(content)
+
+    monkeypatch.setattr(network_core, "apply", install)
+    state_service.apply()
+    monkeypatch.setattr(
+        network_core,
+        "apply",
+        lambda candidate, directory: (_ for _ in ()).throw(
+            NetworkdApplyError("reload failed")
+        ),
+    )
+    with pytest.raises(NetworkdApplyError):
+        state_service.apply()
+
+    status = state_service.status(load_network(state_service.paths).files)
+    assert status.kind is NetworkStatusKind.IN_SYNC
+    assert status.last_outcome is not None
+    assert status.last_outcome.kind is ApplyOutcomeKind.FAILURE
+
+
+def test_later_successful_apply_replaces_failed_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state_service = service(tmp_path)
+    write_desired(tmp_path / "etc/network")
+    monkeypatch.setattr(network_core, "apply", lambda candidate, directory: None)
+    state_service.apply()
+    write_desired(tmp_path / "etc/network", "192.168.20.1/24")
+    monkeypatch.setattr(
+        network_core,
+        "apply",
+        lambda candidate, directory: (_ for _ in ()).throw(
+            NetworkdApplyError("reload failed")
+        ),
+    )
+    with pytest.raises(NetworkdApplyError):
+        state_service.apply()
+    monkeypatch.setattr(network_core, "apply", lambda candidate, directory: None)
+    state_service.apply()
+
+    status = state_service.status(load_network(state_service.paths).files)
+    assert status.last_outcome is not None
+    assert status.last_outcome.kind is ApplyOutcomeKind.SUCCESS
 
 
 def test_network_rollback_restores_all_desired_files(

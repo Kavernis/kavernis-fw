@@ -35,7 +35,12 @@ from kavernis.config.resolver import resolve_network
 from kavernis.core.topology import resolve_topology
 from kavernis.state.history import DesiredStateHistory, HistoryError
 from kavernis.state.lock import network_lock
-from kavernis.state.models import ArtifactDrift, HistoryRevision
+from kavernis.state.models import (
+    ApplyOperationKind,
+    ApplyOutcome,
+    ArtifactDrift,
+    HistoryRevision,
+)
 from kavernis.state.sqlite import SQLiteStateStore
 from kavernis.state.store import StateStore
 
@@ -64,6 +69,7 @@ class NetworkStatus:
     desired_revision: str | None
     applied_revision: str | None
     drift: tuple[ArtifactDrift, ...]
+    last_outcome: ApplyOutcome | None
 
 
 @dataclass(frozen=True)
@@ -224,9 +230,14 @@ class NetworkStateService:
     def status(self, files: dict[str, bytes]) -> NetworkStatus:
         desired_revision = self.history.revision_for_contents(files)
         applied = self.store.get_domain_state(NETWORK_DOMAIN)
+        last_outcome = self.store.get_last_apply_outcome(NETWORK_DOMAIN)
         if applied is None:
             return NetworkStatus(
-                NetworkStatusKind.NOT_YET_APPLIED, desired_revision, None, ()
+                NetworkStatusKind.NOT_YET_APPLIED,
+                desired_revision,
+                None,
+                (),
+                last_outcome,
             )
         if desired_revision != applied.revision:
             matches = desired_revision is None and self.history.contents_match(
@@ -238,6 +249,7 @@ class NetworkStateService:
                     desired_revision,
                     applied.revision,
                     (),
+                    last_outcome,
                 )
             desired_revision = applied.revision
         drift = inspect_artifact_drift(
@@ -248,6 +260,7 @@ class NetworkStateService:
             desired_revision,
             applied.revision,
             drift,
+            last_outcome,
         )
 
     def history_revisions(self) -> list[HistoryRevision]:
@@ -289,6 +302,15 @@ class NetworkStateService:
             }
             desired = desired_from_files(files, f"revision {revision}")
             candidate = plan_network(desired)
+            # Do not overwrite an uncommitted desired state during recovery. Its
+            # exact bytes and optional-resource presence become a normal immutable
+            # desired-state revision, never an applied-state revision.
+            outgoing = desired_from_files(previous, "current network configuration")
+            plan_network(outgoing)
+            if self.history.revision_for_contents(previous) is None:
+                self.history.snapshot(
+                    previous, "preserve network desired state before rollback"
+                )
             written_files = {
                 filename: _with_desired_header(_filename_resource(filename), contents)
                 for filename, contents in files.items()
@@ -309,10 +331,18 @@ class NetworkStateService:
             try:
                 apply(candidate, self.paths.networkd_path)
             except NetworkdApplyError as error:
-                self.store.record_failed_apply(NETWORK_DOMAIN, new_revision, str(error))
+                self.store.record_failed_apply(
+                    NETWORK_DOMAIN,
+                    new_revision,
+                    str(error),
+                    ApplyOperationKind.ROLLBACK,
+                )
                 raise
             self.store.record_successful_apply(
-                NETWORK_DOMAIN, new_revision, artifact_hashes(candidate)
+                NETWORK_DOMAIN,
+                new_revision,
+                artifact_hashes(candidate),
+                ApplyOperationKind.ROLLBACK,
             )
         return candidate
 

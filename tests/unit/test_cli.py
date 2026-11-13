@@ -1,9 +1,11 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from kavernis import cli
 from kavernis.backends.networkd import NetworkdConfiguration
-from kavernis.core.network import NetworkStateService
+from kavernis.core.network import NetworkStateService, NetworkStatus, NetworkStatusKind
+from kavernis.state.models import ApplyOperationKind, ApplyOutcome, ApplyOutcomeKind
 from network_helpers import write_desired as write_network_config
 
 
@@ -111,3 +113,26 @@ def test_edit_retries_invalid_candidate_in_same_cli_session(
     assert cli.main(["edit", "routing"]) == 0
     assert candidates[0] == candidates[1]
     assert "Configuration is invalid:" in capsys.readouterr().err
+
+
+def test_status_prints_synchronization_and_failed_operation_separately(capsys) -> None:
+    cli._print_status(
+        NetworkStatus(
+            NetworkStatusKind.IN_SYNC,
+            "desired",
+            "successful",
+            (),
+            ApplyOutcome(
+                ApplyOperationKind.APPLY,
+                ApplyOutcomeKind.FAILURE,
+                datetime(2026, 1, 1, tzinfo=UTC),
+                "failed",
+                "networkctl reload failed",
+            ),
+        )
+    )
+    output = capsys.readouterr().out
+    assert "Network configuration: in sync" in output
+    assert "Last successful revision: successful" in output
+    assert "Last apply: failed" in output
+    assert "Failure: networkctl reload failed" in output

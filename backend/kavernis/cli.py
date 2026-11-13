@@ -22,6 +22,7 @@ from kavernis.core.network import (
 )
 from kavernis.state.history import HistoryError
 from kavernis.state.lock import LockUnavailableError
+from kavernis.state.models import ApplyOutcomeKind
 from kavernis.state.sqlite import StateStoreError
 
 DEVICES_PATH = "/etc/kavernis/network/devices.yaml"
@@ -178,9 +179,21 @@ def _state_service() -> NetworkStateService:
 
 def _print_status(status: NetworkStatus) -> None:
     """Print Kavernis concepts rather than state-store implementation details."""
-    print(f"Status: {status.kind.value}")
+    print(f"Network configuration: {status.kind.value}")
     print(f"Desired revision: {status.desired_revision or 'unrecorded desired state'}")
-    print(f"Applied revision: {status.applied_revision or 'none'}")
+    print(f"Last successful revision: {status.applied_revision or 'none'}")
+    if status.last_outcome is not None:
+        outcome = status.last_outcome
+        outcome_text = (
+            "failed" if outcome.kind is ApplyOutcomeKind.FAILURE else "success"
+        )
+        print(f"Last apply: {outcome_text}")
+        print(f"Operation: {outcome.operation.value}")
+        print(f"Last operation at: {outcome.recorded_at.isoformat()}")
+        if outcome.revision is not None:
+            print(f"Last operation revision: {outcome.revision}")
+        if outcome.kind is ApplyOutcomeKind.FAILURE and outcome.message is not None:
+            print(f"Failure: {outcome.message}")
     for item in status.drift:
         print(f"Drift: {item.kind.value} {item.filename}")
 

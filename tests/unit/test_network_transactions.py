@@ -117,6 +117,130 @@ def test_rollback_rebuilds_desired_state_and_preserves_history(
     )
 
 
+def test_rollback_preserves_unapplied_desired_state_before_replacing_it(
+    tmp_path, reload_control
+):
+    state = service(tmp_path)
+    directory = state.paths.interfaces_path.parent
+    write_desired(directory)
+    state.apply()
+    first = state.history.current_revision()
+    assert first is not None
+    write_desired(directory, "192.168.20.1/24")
+    state.apply()
+    write_desired(directory, "192.168.30.1/24")
+    outgoing = core.load_network(state.paths).files
+
+    state.rollback(first)
+
+    revisions = state.history_revisions()
+    preserved = next(
+        item
+        for item in revisions
+        if item.message == "preserve network desired state before rollback"
+    )
+    assert state.history.contents_match(preserved.identifier, outgoing)
+    assert "192.168.10.1/24" in state.paths.interfaces_path.read_text()
+
+
+@pytest.mark.parametrize("routing_exists", [True, False])
+def test_rollback_preserves_optional_routing_file_presence(
+    tmp_path, reload_control, routing_exists
+):
+    state = service(tmp_path)
+    directory = state.paths.interfaces_path.parent
+    write_desired(directory)
+    if routing_exists:
+        state.paths.routing_path.unlink()
+    state.apply()
+    first = state.history.current_revision()
+    assert first is not None
+    write_desired(directory, "192.168.20.1/24")
+    state.apply()
+    if routing_exists:
+        state.paths.routing_path.write_text(
+            "version: 2\ngateways: []\nroutes: []\n# new\n"
+        )
+    else:
+        state.paths.routing_path.unlink()
+    outgoing = core.load_network(state.paths).files
+
+    state.rollback(first)
+
+    preserved = next(
+        item
+        for item in state.history_revisions()
+        if item.message == "preserve network desired state before rollback"
+    )
+    assert state.history.contents_match(preserved.identifier, outgoing)
+
+
+def test_invalid_outgoing_desired_state_aborts_rollback_before_replacement(
+    tmp_path, reload_control
+):
+    state = service(tmp_path)
+    directory = state.paths.interfaces_path.parent
+    write_desired(directory)
+    state.apply()
+    first = state.history.current_revision()
+    assert first is not None
+    state.paths.interfaces_path.write_text(
+        state.paths.interfaces_path.read_text().replace("lan-nic", "absent")
+    )
+    outgoing = state.paths.interfaces_path.read_bytes()
+    calls = reload_control["calls"]
+
+    with pytest.raises(ValueError, match="does not exist"):
+        state.rollback(first)
+    assert state.paths.interfaces_path.read_bytes() == outgoing
+    assert reload_control["calls"] == calls
+
+
+def test_rollback_does_not_snapshot_outgoing_state_already_at_history_head(
+    tmp_path, reload_control
+):
+    state = service(tmp_path)
+    directory = state.paths.interfaces_path.parent
+    write_desired(directory)
+    state.apply()
+    first = state.history.current_revision()
+    assert first is not None
+    write_desired(directory, "192.168.20.1/24")
+    state.apply()
+
+    state.rollback(first)
+
+    assert all(
+        item.message != "preserve network desired state before rollback"
+        for item in state.history_revisions()
+    )
+
+
+def test_failed_outgoing_snapshot_aborts_rollback_before_desired_replacement(
+    tmp_path, monkeypatch, reload_control
+):
+    state = service(tmp_path)
+    directory = state.paths.interfaces_path.parent
+    write_desired(directory)
+    state.apply()
+    first = state.history.current_revision()
+    assert first is not None
+    write_desired(directory, "192.168.20.1/24")
+    state.apply()
+    write_desired(directory, "192.168.30.1/24")
+    outgoing = core.load_network(state.paths).files
+    calls = reload_control["calls"]
+
+    def fail_snapshot(*_):
+        raise HistoryError("cannot preserve outgoing desired state")
+
+    monkeypatch.setattr(state.history, "snapshot", fail_snapshot)
+    with pytest.raises(HistoryError, match="cannot preserve"):
+        state.rollback(first)
+    assert core.load_network(state.paths).files == outgoing
+    assert reload_control["calls"] == calls
+
+
 def test_failed_native_rollback_keeps_attempted_desired_and_previous_applied(
     tmp_path,
     reload_control,

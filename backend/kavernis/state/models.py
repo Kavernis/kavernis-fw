@@ -25,6 +25,31 @@ class AppliedDomainState:
     artifact_hashes: Mapping[str, str]
 
 
+class ApplyOperationKind(StrEnum):
+    """State-changing operation recorded by the applied-state store."""
+
+    APPLY = "apply"
+    ROLLBACK = "rollback"
+
+
+class ApplyOutcomeKind(StrEnum):
+    """Outcome of the most recently recorded state-changing operation."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
+@dataclass(frozen=True)
+class ApplyOutcome:
+    """Outcome metadata separate from the last successful applied state."""
+
+    operation: ApplyOperationKind
+    kind: ApplyOutcomeKind
+    recorded_at: datetime
+    revision: str | None
+    message: str | None
+
+
 class ArtifactDriftKind(StrEnum):
     """Kinds of managed-artifact mismatch."""
 

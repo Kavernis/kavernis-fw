@@ -5,9 +5,14 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kavernis.state.models import AppliedDomainState
+from kavernis.state.models import (
+    AppliedDomainState,
+    ApplyOperationKind,
+    ApplyOutcome,
+    ApplyOutcomeKind,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StateStoreError(RuntimeError):
@@ -28,17 +33,21 @@ class SQLiteStateStore:
         self._initialize()
         try:
             with self._connect() as connection:
+                connection.execute("BEGIN")
                 row = connection.execute(
                     "SELECT revision, applied_at FROM domain_state WHERE domain = ?",
                     (domain,),
                 ).fetchone()
                 if row is None:
+                    connection.rollback()
                     return None
+                self._after_domain_state_row_read()
                 artifacts = connection.execute(
                     "SELECT filename, sha256 FROM artifact_hash "
                     "WHERE domain = ? ORDER BY filename",
                     (domain,),
                 ).fetchall()
+                connection.rollback()
         except sqlite3.Error as error:
             raise StateStoreError(f"cannot read Kavernis state: {error}") from error
         return AppliedDomainState(
@@ -50,8 +59,36 @@ class SQLiteStateStore:
             },
         )
 
+    def get_last_apply_outcome(self, domain: str) -> ApplyOutcome | None:
+        self._initialize()
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT operation, outcome, revision, recorded_at, message "
+                    "FROM apply_operation WHERE domain = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (domain,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise StateStoreError(
+                f"cannot read Kavernis apply outcome: {error}"
+            ) from error
+        if row is None:
+            return None
+        return ApplyOutcome(
+            operation=ApplyOperationKind(str(row[0])),
+            kind=ApplyOutcomeKind(str(row[1])),
+            revision=str(row[2]) if row[2] is not None else None,
+            recorded_at=datetime.fromisoformat(str(row[3])),
+            message=str(row[4]) if row[4] is not None else None,
+        )
+
     def record_successful_apply(
-        self, domain: str, revision: str, artifact_hashes: Mapping[str, str]
+        self,
+        domain: str,
+        revision: str,
+        artifact_hashes: Mapping[str, str],
+        operation: ApplyOperationKind = ApplyOperationKind.APPLY,
     ) -> None:
         self._initialize()
         applied_at = datetime.now(UTC).isoformat()
@@ -77,13 +114,29 @@ class SQLiteStateStore:
                             for filename, sha256 in sorted(artifact_hashes.items())
                         ],
                     )
+                    self._record_outcome(
+                        connection,
+                        domain,
+                        operation,
+                        ApplyOutcomeKind.SUCCESS,
+                        revision,
+                        None,
+                        applied_at,
+                    )
         except sqlite3.Error as error:
             raise StateStoreError(
                 f"cannot record applied Kavernis state: {error}"
             ) from error
 
-    def record_failed_apply(self, domain: str, revision: str, message: str) -> None:
+    def record_failed_apply(
+        self,
+        domain: str,
+        revision: str,
+        message: str,
+        operation: ApplyOperationKind = ApplyOperationKind.APPLY,
+    ) -> None:
         self._initialize()
+        failed_at = datetime.now(UTC).isoformat()
         try:
             with self._connect() as connection:
                 with connection:
@@ -91,7 +144,16 @@ class SQLiteStateStore:
                         "INSERT INTO apply_failure(domain, revision, failed_at, "
                         "message) "
                         "VALUES (?, ?, ?, ?)",
-                        (domain, revision, datetime.now(UTC).isoformat(), message),
+                        (domain, revision, failed_at, message),
+                    )
+                    self._record_outcome(
+                        connection,
+                        domain,
+                        operation,
+                        ApplyOutcomeKind.FAILURE,
+                        revision,
+                        message,
+                        failed_at,
                     )
         except sqlite3.Error as error:
             raise StateStoreError(
@@ -100,6 +162,26 @@ class SQLiteStateStore:
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.database_path)
+
+    def _after_domain_state_row_read(self) -> None:
+        """Test seam between the two reads in one SQLite snapshot transaction."""
+
+    @staticmethod
+    def _record_outcome(
+        connection: sqlite3.Connection,
+        domain: str,
+        operation: ApplyOperationKind,
+        outcome: ApplyOutcomeKind,
+        revision: str | None,
+        message: str | None,
+        recorded_at: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO apply_operation("
+            "domain, operation, outcome, revision, recorded_at, message) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (domain, operation.value, outcome.value, revision, recorded_at, message),
+        )
 
     def _initialize(self) -> None:
         try:
@@ -119,6 +201,8 @@ class SQLiteStateStore:
                             (SCHEMA_VERSION,),
                         )
                         self._create_schema(connection)
+                    elif int(row[0]) == 1:
+                        self._migrate_v1_to_v2(connection)
                     elif int(row[0]) != SCHEMA_VERSION:
                         raise StateSchemaError(
                             "unsupported Kavernis state schema version "
@@ -147,4 +231,29 @@ class SQLiteStateStore:
             "CREATE TABLE apply_failure ("
             "id INTEGER PRIMARY KEY, domain TEXT NOT NULL, revision TEXT NOT NULL, "
             "failed_at TEXT NOT NULL, message TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE apply_operation ("
+            "id INTEGER PRIMARY KEY, domain TEXT NOT NULL, operation TEXT NOT NULL, "
+            "outcome TEXT NOT NULL, revision TEXT, recorded_at TEXT NOT NULL, "
+            "message TEXT)"
+        )
+
+    @staticmethod
+    def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+        """Add typed operation outcomes without altering successful state."""
+        connection.execute(
+            "CREATE TABLE apply_operation ("
+            "id INTEGER PRIMARY KEY, domain TEXT NOT NULL, operation TEXT NOT NULL, "
+            "outcome TEXT NOT NULL, revision TEXT, recorded_at TEXT NOT NULL, "
+            "message TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO apply_operation("
+            "domain, operation, outcome, revision, recorded_at, message) "
+            "SELECT domain, 'apply', 'failure', revision, failed_at, message "
+            "FROM apply_failure ORDER BY id"
+        )
+        connection.execute(
+            "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
         )

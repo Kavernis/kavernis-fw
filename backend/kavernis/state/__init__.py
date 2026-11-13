@@ -5,11 +5,21 @@ from kavernis.state.history import (
     HistoryError,
     RevisionNotFoundError,
 )
-from kavernis.state.models import AppliedDomainState, ArtifactDrift, HistoryRevision
+from kavernis.state.models import (
+    AppliedDomainState,
+    ApplyOperationKind,
+    ApplyOutcome,
+    ApplyOutcomeKind,
+    ArtifactDrift,
+    HistoryRevision,
+)
 from kavernis.state.sqlite import SQLiteStateStore
 
 __all__ = [
     "AppliedDomainState",
+    "ApplyOperationKind",
+    "ApplyOutcome",
+    "ApplyOutcomeKind",
     "ArtifactDrift",
     "DesiredStateHistory",
     "HistoryError",
