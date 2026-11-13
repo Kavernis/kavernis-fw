@@ -10,7 +10,7 @@ from typing import NoReturn
 from kavernis.state.models import HistoryRevision
 
 _REVISION_PATTERN = re.compile(r"[0-9a-f]{7,40}\Z")
-_DESIRED_FILENAME_PATTERN = re.compile(r"[a-z][a-z0-9-]*\.yaml\Z")
+_DESIRED_FILENAME_PATTERN = re.compile(r"network/(devices|interfaces|routing)\.yaml\Z")
 
 
 class HistoryError(RuntimeError):
@@ -33,7 +33,9 @@ class DesiredStateHistory:
         self._initialize()
         tracked = set(self.file_names())
         for filename, contents in files.items():
-            (self.repository_path / filename).write_bytes(contents)
+            path = self.repository_path / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
         for filename in tracked - set(files):
             (self.repository_path / filename).unlink(missing_ok=True)
         self._run("add", "-A", "--", *sorted(tracked | set(files)))
@@ -92,6 +94,8 @@ class DesiredStateHistory:
 
     def list_revisions(self) -> list[HistoryRevision]:
         self._initialize()
+        if self.current_revision() is None:
+            return []
         result = self._run("log", "--format=%H%x00%cI%x00%s")
         revisions: list[HistoryRevision] = []
         for line in result.stdout.splitlines():
@@ -105,14 +109,15 @@ class DesiredStateHistory:
         self._validate_revision(revision)
         self._validate_files({filename: b""})
         resolved = self._resolve_revision(revision)
-        result = self._run("show", f"{resolved}:{filename}", check=False)
+        result = self._run_bytes("show", f"{resolved}:{filename}", check=False)
         if result.returncode != 0:
             raise RevisionNotFoundError(
                 f"revision {revision} does not contain {filename}"
             )
-        return result.stdout.encode()
+        return result.stdout
 
     def _resolve_revision(self, revision: str) -> str:
+        self._validate_revision(revision)
         result = self._run(
             "rev-parse", "--verify", f"{revision}^{{commit}}", check=False
         )
@@ -135,19 +140,38 @@ class DesiredStateHistory:
     def _run(
         self, *arguments: str, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
+        result = self._run_bytes(*arguments, check=check)
+        return subprocess.CompletedProcess(
+            result.args,
+            result.returncode,
+            result.stdout.decode("utf-8"),
+            result.stderr.decode("utf-8"),
+        )
+
+    def _run_bytes(
+        self, *arguments: str, check: bool = True
+    ) -> subprocess.CompletedProcess[bytes]:
         try:
             result = subprocess.run(
-                ["git", "-C", str(self.repository_path), *arguments],
+                [
+                    "git",
+                    "-c",
+                    "core.autocrlf=false",
+                    "-C",
+                    str(self.repository_path),
+                    *arguments,
+                ],
                 check=False,
                 capture_output=True,
-                text=True,
             )
         except OSError as error:
             raise HistoryError(
                 f"cannot execute Git for desired-state history: {error}"
             ) from error
         if check and result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
+            detail = (result.stderr.strip() or result.stdout.strip()).decode(
+                "utf-8", errors="replace"
+            )
             raise HistoryError(f"desired-state history operation failed: {detail}")
         return result
 

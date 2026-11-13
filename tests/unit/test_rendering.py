@@ -9,7 +9,7 @@ from kavernis.rendering import render_template
 
 def test_network_template_renders_resolved_context() -> None:
     content = render_template(
-        "interfaces/network.j2",
+        "network/network.j2",
         {
             "device": "eth1",
             "addresses": ("192.0.2.1/24",),
@@ -19,6 +19,7 @@ def test_network_template_renders_resolved_context() -> None:
             "link_local_addressing": None,
             "vlans": (),
             "bridge": None,
+            "routes": (),
         },
     )
 
@@ -29,11 +30,11 @@ def test_network_template_renders_resolved_context() -> None:
 
 def test_missing_template_context_is_an_error() -> None:
     with pytest.raises(UndefinedError):
-        render_template("interfaces/network.j2", {})
+        render_template("network/network.j2", {})
 
 
 def test_templates_are_available_through_package_resources() -> None:
-    template = files("kavernis").joinpath("templates/interfaces/network.j2")
+    template = files("kavernis").joinpath("templates/network/network.j2")
 
     assert template.is_file()
     assert template.read_text(encoding="utf-8").startswith("[Match]\n")

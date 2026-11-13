@@ -16,7 +16,7 @@ UseDNS={{ dhcp_v4.use_dns }}
 UseRoutes={{ dhcp_v4.use_routes }}
 UseNTP={{ dhcp_v4.use_ntp }}
 {% if dhcp_v4.route_metric is not none %}RouteMetric={{ dhcp_v4.route_metric }}
-{% endif %}{% endif %}{% for route in routes|default(()) %}
+{% endif %}{% endif %}{% for route in routes %}
 [Route]
 Destination={{ route.destination }}
 {% if route.gateway is not none %}Gateway={{ route.gateway }}

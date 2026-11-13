@@ -1,14 +1,25 @@
-"""Resolved backend-independent routing domain objects."""
+"""Immutable static routing intent, referencing logical interface identities."""
 
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
 
 
 @dataclass(frozen=True)
-class ResolvedRoute:
-    """A route attached to its resolved interface and optional next-hop."""
+class Gateway:
+    id: str
+    interface: str
+    address: IPv4Address | IPv6Address | None = None
+    onlink: bool = False
 
+
+@dataclass(frozen=True)
+class Route:
     id: str
     network: IPv4Network | IPv6Network
-    gateway_address: IPv4Address | IPv6Address | None
-    gateway_onlink: bool
+    gateway: str
+
+
+@dataclass(frozen=True)
+class RoutingModel:
+    gateways: tuple[Gateway, ...] = ()
+    routes: tuple[Route, ...] = ()

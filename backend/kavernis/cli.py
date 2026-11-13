@@ -24,9 +24,9 @@ from kavernis.state.history import HistoryError
 from kavernis.state.lock import LockUnavailableError
 from kavernis.state.sqlite import StateStoreError
 
-INTERFACES_PATH = "/etc/kavernis/interfaces.yaml"
-GATEWAYS_PATH = "/etc/kavernis/gateways.yaml"
-ROUTES_PATH = "/etc/kavernis/routes.yaml"
+DEVICES_PATH = "/etc/kavernis/network/devices.yaml"
+INTERFACES_PATH = "/etc/kavernis/network/interfaces.yaml"
+ROUTING_PATH = "/etc/kavernis/network/routing.yaml"
 HISTORY_PATH = "/var/lib/kavernis/history"
 STATE_DATABASE_PATH = "/var/lib/kavernis/state.db"
 NETWORKD_PATH = "/etc/systemd/network"
@@ -48,9 +48,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     edit_command = action.add_parser(
         "edit", help="safely edit one network desired-state resource"
     )
-    edit_command.add_argument(
-        "resource", choices=("interfaces", "gateways", "routes")
-    )
+    edit_command.add_argument("resource", choices=("devices", "interfaces", "routing"))
     diff_command = action.add_parser("diff", help="show desired-state differences")
     diff_command.add_argument("resource", choices=("network",))
     diff_command.add_argument("revision", nargs="?")
@@ -168,8 +166,8 @@ def _state_service() -> NetworkStateService:
     return NetworkStateService(
         NetworkStatePaths(
             interfaces_path=Path(INTERFACES_PATH),
-            gateways_path=Path(GATEWAYS_PATH),
-            routes_path=Path(ROUTES_PATH),
+            devices_path=Path(DEVICES_PATH),
+            routing_path=Path(ROUTING_PATH),
             history_path=Path(HISTORY_PATH),
             database_path=Path(STATE_DATABASE_PATH),
             networkd_path=Path(NETWORKD_PATH),
