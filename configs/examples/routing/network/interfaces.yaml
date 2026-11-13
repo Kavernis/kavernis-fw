@@ -1,0 +1,12 @@
+version: 2
+
+interfaces:
+  - id: lan
+    name: LAN
+    device: lan-bridge
+    ipv4:
+      mode: static
+      address: 192.168.10.1/24
+    ipv6:
+      mode: static
+      address: 2001:db8:10::1/64

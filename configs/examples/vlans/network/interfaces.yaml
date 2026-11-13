@@ -1,0 +1,20 @@
+version: 2
+
+interfaces:
+  - id: wan
+    name: WAN
+    device: wan-nic
+    ipv4:
+      mode: dhcp
+  - id: users
+    name: USERS
+    device: users-vlan
+    ipv4:
+      mode: static
+      address: 192.168.10.1/24
+  - id: iot
+    name: IOT
+    device: iot-vlan
+    ipv4:
+      mode: static
+      address: 192.168.30.1/24

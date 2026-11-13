@@ -1,9 +1,8 @@
-version: 1
+version: 2
 
 interfaces:
   - id: wan
     name: WAN
-    device: enp1s0
-
+    device: wan-nic
     ipv4:
       mode: dhcp

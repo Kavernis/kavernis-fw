@@ -1,0 +1,15 @@
+version: 2
+
+devices:
+  - id: port-one
+    type: physical
+    name: enp2s0
+  - id: port-two
+    type: physical
+    name: enp3s0
+  - id: lan-bridge
+    type: bridge
+    name: br0
+    bridge:
+      members: [port-one, port-two]
+      stp: true

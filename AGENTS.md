@@ -39,7 +39,7 @@ Kavernis distinguishes three different configuration states:
 ```text
 Desired State
      │
-     │ /etc/kavernis/*.yaml
+     │ /etc/kavernis/network/*.yaml
      │
      ▼
    Kavernis
@@ -70,9 +70,9 @@ The canonical current desired state is stored as declarative YAML under:
 Examples:
 
 ```text
-/etc/kavernis/interfaces.yaml
-/etc/kavernis/gateways.yaml
-/etc/kavernis/routes.yaml
+/etc/kavernis/network/devices.yaml
+/etc/kavernis/network/interfaces.yaml
+/etc/kavernis/network/routing.yaml
 /etc/kavernis/firewall.yaml
 /etc/kavernis/dhcp.yaml
 /etc/kavernis/dns.yaml
@@ -167,7 +167,7 @@ The state database may contain information such as:
 Example conceptual record:
 
 ```text
-domain: interfaces
+domain: network
 desired_revision: 9f2ab31
 applied_revision: 72ad991
 applied_at: 2026-09-30T18:30:00Z
@@ -218,7 +218,7 @@ Kavernis MUST maintain a clear responsibility boundary:
 
 | State | Storage | Responsibility |
 |---|---|---|
-| Desired | `/etc/kavernis/*.yaml` | current user intent |
+| Desired | `/etc/kavernis/network/*.yaml` | current user intent |
 | Desired history | internal Git repository | revision history and audit |
 | Applied | SQLite | last known successful application state |
 | Generated | native files | implementation artifacts |
@@ -631,7 +631,7 @@ Current example:
 
 ```text
 backend/kavernis/templates/
-└── interfaces/
+└── network/
     ├── network.j2
     ├── vlan.netdev.j2
     └── bridge.netdev.j2
@@ -764,7 +764,8 @@ Configuration objects use `domain + id` as their immutable logical identity.
 
 * `id` — immutable human-readable identifier used for configuration references
 
-`name` is a mutable display attribute.
+`name` is a mutable display attribute for logical interfaces. A network
+device's `name` is its Linux kernel name; its `id` remains the reference identity.
 
 References between configuration objects SHOULD use `id`.
 

@@ -1,0 +1,15 @@
+version: 2
+
+interfaces:
+  - id: wan
+    name: WAN
+    device: wan-nic
+    ipv4:
+      mode: dhcp
+      dhcp:
+        use_hostname: false
+        send_hostname: true
+        use_dns: false
+        use_routes: true
+        use_ntp: false
+        route_metric: 200

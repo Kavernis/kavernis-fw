@@ -1,0 +1,261 @@
+{
+  "$defs": {
+    "DHCPv4Config": {
+      "additionalProperties": false,
+      "description": "Kavernis DHCPv4 policy, resolved independently of networkd defaults.",
+      "properties": {
+        "use_hostname": {
+          "default": false,
+          "title": "Use Hostname",
+          "type": "boolean"
+        },
+        "send_hostname": {
+          "default": true,
+          "title": "Send Hostname",
+          "type": "boolean"
+        },
+        "use_dns": {
+          "default": true,
+          "title": "Use Dns",
+          "type": "boolean"
+        },
+        "use_routes": {
+          "default": true,
+          "title": "Use Routes",
+          "type": "boolean"
+        },
+        "use_ntp": {
+          "default": true,
+          "title": "Use Ntp",
+          "type": "boolean"
+        },
+        "route_metric": {
+          "anyOf": [
+            {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Route Metric"
+        }
+      },
+      "title": "DHCPv4Config",
+      "type": "object"
+    },
+    "IPv4Config": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "address": {
+                "type": "null"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "static"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "address": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "address"
+            ]
+          }
+        },
+        {
+          "else": {
+            "not": {
+              "required": [
+                "dhcp"
+              ]
+            }
+          },
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "dhcp"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/IPv4Mode"
+        },
+        "address": {
+          "anyOf": [
+            {
+              "format": "ipv4interface",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Address"
+        },
+        "dhcp": {
+          "$ref": "#/$defs/DHCPv4Config"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "IPv4Config",
+      "type": "object"
+    },
+    "IPv4Mode": {
+      "enum": [
+        "static",
+        "dhcp",
+        "disabled"
+      ],
+      "title": "IPv4Mode",
+      "type": "string"
+    },
+    "IPv6Config": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "address": {
+                "type": "null"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "static"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "address": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "address"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/IPv6Mode"
+        },
+        "address": {
+          "anyOf": [
+            {
+              "format": "ipv6interface",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Address"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "IPv6Config",
+      "type": "object"
+    },
+    "IPv6Mode": {
+      "enum": [
+        "static",
+        "dhcp6",
+        "slaac",
+        "disabled"
+      ],
+      "title": "IPv6Mode",
+      "type": "string"
+    },
+    "LogicalInterfaceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "\\S",
+          "title": "Name",
+          "type": "string"
+        },
+        "device": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Device",
+          "type": "string"
+        },
+        "ipv4": {
+          "$ref": "#/$defs/IPv4Config"
+        },
+        "ipv6": {
+          "$ref": "#/$defs/IPv6Config"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "device"
+      ],
+      "title": "LogicalInterfaceConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 2,
+      "title": "Version",
+      "type": "integer"
+    },
+    "interfaces": {
+      "items": {
+        "$ref": "#/$defs/LogicalInterfaceConfig"
+      },
+      "title": "Interfaces",
+      "type": "array"
+    }
+  },
+  "required": [
+    "version",
+    "interfaces"
+  ],
+  "title": "LogicalInterfacesConfig",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

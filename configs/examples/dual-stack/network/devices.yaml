@@ -1,0 +1,9 @@
+version: 2
+
+devices:
+  - id: wan-nic
+    type: physical
+    name: enp1s0
+  - id: lan-nic
+    type: physical
+    name: enp2s0

@@ -1,0 +1,21 @@
+version: 2
+
+devices:
+  - id: wan-nic
+    type: physical
+    name: enp1s0
+  - id: lan-nic
+    type: physical
+    name: enp2s0
+  - id: users-vlan
+    type: vlan
+    name: vlan10
+    vlan:
+      parent: lan-nic
+      tag: 10
+  - id: iot-vlan
+    type: vlan
+    name: vlan30
+    vlan:
+      parent: lan-nic
+      tag: 30
