@@ -57,7 +57,9 @@ def service(tmp_path: Path) -> NetworkStateService:
             database_path=tmp_path / "state.db",
             networkd_path=tmp_path / "networkd",
             lock_path=tmp_path / "run/network.lock",
-        )
+        ),
+        inspector=PhysicalRuntime(tmp_path / "networkd"),
+        verification_timeout=0.02,
     )
 
 
@@ -69,3 +71,52 @@ def resolved_model(config):
             config.routing,
         )
     )
+
+
+class PhysicalRuntime:
+    """Unit-test simulator only; artifact contents are NOT Linux observations.
+
+    Existing transaction fixtures have one eth1 physical device. Dedicated
+    runtime tests exercise real JSON parsing and scripted convergence failures.
+    """
+
+    def __init__(self, directory):
+        self.directory = directory
+
+    def inspect(self, timeout):
+        from kavernis.backends.network_runtime import (
+            NetworkRuntimeSnapshot,
+            RuntimeLink,
+        )
+
+        links = []
+        for identifier, name in (("lan-nic", "eth1"), ("wan-nic", "enp1s0")):
+            path = self.directory / f"10-kavernis-{identifier}.network"
+            addresses = (
+                frozenset(
+                    line.removeprefix("Address=")
+                    for line in path.read_text().splitlines()
+                    if line.startswith("Address=")
+                )
+                if path.exists()
+                else frozenset()
+            )
+            links.append(
+                RuntimeLink(
+                    name,
+                    addresses=addresses,
+                    configured_static_addresses=addresses,
+                    network_file=str(path),
+                    setup_state="configured",
+                )
+            )
+        return NetworkRuntimeSnapshot(tuple(links))
+
+
+def fake_activation(candidate, directory, **callbacks):
+    """Explicit orchestration stub, not a native application test."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for filename, content in candidate.files.items():
+        (directory / filename).write_text(content)
+    callbacks["verify"]()
+    callbacks["record"]()

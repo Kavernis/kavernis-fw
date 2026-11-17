@@ -47,7 +47,10 @@ def test_apply_network_uses_one_network_transaction(
     monkeypatch.setattr(NetworkStateService, "apply", apply)
     assert cli.main(["apply", "network"]) == 0
     assert applied == [True]
-    assert capsys.readouterr().out == "Applied 1 systemd-networkd file(s).\n"
+    assert (
+        "Configuration activation and static runtime verified"
+        in capsys.readouterr().out
+    )
 
 
 @pytest.mark.parametrize("action", ["plan", "apply", "status", "history", "diff"])

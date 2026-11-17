@@ -1,6 +1,7 @@
 """Whole network transactions with real temporary history/SQLite/artifacts.
 
-Only networkctl is mocked. No test invokes native networking on the host.
+Networkctl is mocked and runtime is simulated from test artifacts.
+No test invokes native networking on the host.
 """
 
 import subprocess
@@ -40,9 +41,8 @@ def test_apply_cleans_obsolete_owned_artifacts_and_preserves_unrelated(
     state = service(tmp_path)
     write_desired(state.paths.interfaces_path.parent)
     native = state.paths.networkd_path
-    native.mkdir()
+    state.apply()
     (native / "10-kavernis-obsolete.network").write_bytes(b"old\r\n")
-    (native / "10-kavernis-obsolete.netdev").write_bytes(b"old virtual\n")
     unrelated = {
         "20-other.network": b"unrelated\n",
         "10-kavernis-not-owned.link": b"unrelated link\n",
@@ -60,7 +60,7 @@ def test_apply_cleans_obsolete_owned_artifacts_and_preserves_unrelated(
         state.status(core.load_network(state.paths).files).kind
         is core.NetworkStatusKind.IN_SYNC
     )
-    assert reload_control["calls"] == 1
+    assert reload_control["calls"] == 2
 
 
 def test_failed_apply_restores_exact_artifacts_and_successful_metadata(
@@ -337,7 +337,7 @@ def test_applied_metadata_failure_is_reported_after_native_success(
     previous = state.store.get_domain_state("network")
     write_desired(state.paths.interfaces_path.parent, "192.168.20.1/24")
 
-    def fail(*_):
+    def fail(*_, **kwargs):
         raise StateStoreError("metadata write failed")
 
     monkeypatch.setattr(state.store, "record_successful_apply", fail)
@@ -345,7 +345,7 @@ def test_applied_metadata_failure_is_reported_after_native_success(
         state.apply()
     assert state.store.get_domain_state("network") == previous
     assert (
-        "192.168.20.1/24"
+        "192.168.10.1/24"
         in (state.paths.networkd_path / "10-kavernis-lan-nic.network").read_text()
     )
 

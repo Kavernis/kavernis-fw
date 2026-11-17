@@ -226,3 +226,53 @@ def test_failed_recovery_reload_is_reported(tmp_path, monkeypatch):
             ),
             tmp_path,
         )
+
+
+def test_reload_timeout_restores_artifacts_and_is_bounded(tmp_path, monkeypatch):
+    from kavernis.backends import networkd
+
+    candidate = NetworkdConfiguration(
+        {
+            "10-kavernis-nic.network": "[Match]\nName=eth0\n\n[Network]\n",
+        }
+    )
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(kwargs)
+        if kwargs["check"]:
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(NetworkdApplyError, match="native reload"):
+        networkd.apply(candidate, tmp_path, reload_timeout=0.1)
+    assert not list(tmp_path.iterdir())
+    assert [call["timeout"] for call in calls] == [0.1, 0.1]
+
+
+def test_interrupt_reading_artifact_baseline_does_not_start_recovery(
+    tmp_path, monkeypatch
+):
+    from kavernis.backends import networkd
+
+    interruption = KeyboardInterrupt()
+
+    def cancel(*args):
+        raise interruption
+
+    monkeypatch.setattr(networkd, "_managed_files_bytes", cancel)
+    monkeypatch.setattr(
+        networkd, "_restore", lambda *a: pytest.fail("recovery before mutation")
+    )
+    with pytest.raises(KeyboardInterrupt) as caught:
+        networkd.apply(
+            NetworkdConfiguration(
+                {
+                    "10-kavernis-nic.network": "[Match]\nName=eth0\n\n[Network]\n",
+                }
+            ),
+            tmp_path,
+        )
+    assert caught.value is interruption
+    assert "before native mutation" in " ".join(interruption.__notes__)

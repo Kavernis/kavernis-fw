@@ -93,18 +93,22 @@ Configuration-management writers must honor the same advisory lock.
 load and validate desired resources
   → resolve graph and routing
   → generate and validate native candidate
+  → SQLite preflight and applied Git topology reconstruction
+  → classify transition and check observed topology
   → identify/snapshot desired Git revision
   → install native candidate and reload
+  → bounded verification of static Linux state and networkd association
   → record successful revision and artifact hashes in SQLite
 ```
 
-A failed native apply restores the prior managed artifacts where possible,
-attempts a reload, and records failure information separately. It never advances
-the successful SQLite revision. If recovery itself fails, the error reports that
-explicitly. If native activation succeeds but SQLite recording fails, the command
-fails loudly; native files may have changed while SQLite retains its previous
-successful revision. Git, SQLite and native configuration are not one atomic
-transaction.
+A failed native transaction restores prior managed artifacts where possible,
+attempts a reload and verifies the prior required static state when a matching
+applied baseline exists. Failure information is recorded separately. Cancellation
+is re-raised with recovery details. Runtime verification precedes SQLite success
+recording; a later database failure still triggers recovery and is reported.
+Git, SQLite and Linux are not one atomic transaction. The exact checks and
+remaining commit/crash windows are documented in
+[network application safety](network-application-safety.md).
 
 History contains only the three permitted desired resource paths. Snapshots
 preserve optional routing absence and exact bytes, including line endings.
@@ -112,8 +116,9 @@ Revision identifiers are validated before Git execution; Git uses explicit
 argument arrays. Matching content reuses the current revision. No normal
 operation rewrites history.
 
-Rollback reads and validates the requested desired snapshot, restores its
-resource set, records a new changed desired revision and regenerates/reapplies.
+Rollback reads and validates the requested desired snapshot, performs SQLite and
+structural-transition preflight before replacing live YAML, restores its resource
+set, records a new changed desired revision and regenerates/reapplies.
 A pre-activation YAML write or history failure attempts to restore the prior
 desired resource set. It does not restore historical native files. Native failure
 leaves the attempted
@@ -127,12 +132,12 @@ SQLite; the CLI's status categories remain the existing four categories.
 
 ## Operational limits
 
-`networkctl reload` is the existing activation mechanism. Successful return is
-not proof of link readiness, address acquisition, route reachability or continued
-management connectivity. Restoring configuration files does not guarantee
-recovery of live virtual devices or addresses. Runtime verification, watchdog
-rollback, and virtual-device retirement need a separate disposable-host tested
-change.
+`networkctl reload` remains the activation mechanism. Its successful return alone
+is insufficient: the backend observes Linux and networkd through a typed runtime
+inspector and core requires static verification before success recording.
+Dynamic acquisition, reachability and continued management connectivity are not
+verified. Automatic virtual-device recreation/retirement and watchdog recovery
+remain unsupported; structural transitions requiring them are rejected.
 
 Replacement is atomic per file, not a crash-atomic transaction spanning all YAML
 files, native files, Git and SQLite. Advisory locking cannot protect against

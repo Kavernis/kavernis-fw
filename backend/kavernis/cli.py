@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from kavernis.backends.network_runtime import RuntimeVerificationError
 from kavernis.backends.networkd import NetworkdApplyError, NetworkdConfiguration
 from kavernis.config.errors import ConfigurationError
 from kavernis.core.network import (
@@ -75,6 +76,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "Rolled back and applied "
                 f"{len(candidate.files)} systemd-networkd file(s)."
             )
+            print(
+                "Configuration activation and static runtime verified; "
+                "dynamic acquisition and connectivity are not verified."
+            )
         elif parsed.action == "edit":
             changed = service.edit_resource(
                 parsed.resource, _invoke_editor, _retry_invalid_edit
@@ -83,6 +88,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         elif parsed.action == "apply":
             candidate = service.apply()
             print(f"Applied {len(candidate.files)} systemd-networkd file(s).")
+            print(
+                "Configuration activation and static runtime verified; "
+                "dynamic acquisition and connectivity are not verified."
+            )
         else:
             desired = load_network(service.paths)
             if parsed.action == "plan":
@@ -105,6 +114,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         HistoryError,
         NetworkdApplyError,
         StateStoreError,
+        RuntimeVerificationError,
         LockUnavailableError,
         DesiredStateChangedError,
         EditorFailedError,
@@ -112,10 +122,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
         OSError,
     ) as error:
         print(f"Error: {error}", file=sys.stderr)
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
-        print("Aborted; desired state was unchanged.", file=sys.stderr)
+    except KeyboardInterrupt as error:
+        print("Interrupted.", file=sys.stderr)
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
         return 1
+    except SystemExit as error:
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
+        raise
     return 0
 
 

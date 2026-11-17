@@ -5,6 +5,7 @@ from typing import Protocol
 
 from kavernis.state.models import (
     AppliedDomainState,
+    ApplyCommit,
     ApplyOperationKind,
     ApplyOutcome,
 )
@@ -12,6 +13,8 @@ from kavernis.state.models import (
 
 class StateStore(Protocol):
     """Persistence used by core orchestration, independent of SQLite."""
+
+    def preflight(self, domain: str) -> None: ...
 
     def get_domain_state(self, domain: str) -> AppliedDomainState | None: ...
 
@@ -23,12 +26,14 @@ class StateStore(Protocol):
         revision: str,
         artifact_hashes: Mapping[str, str],
         operation: ApplyOperationKind = ApplyOperationKind.APPLY,
+        *,
+        commit: ApplyCommit | None = None,
     ) -> None: ...
 
     def record_failed_apply(
         self,
         domain: str,
-        revision: str,
+        revision: str | None,
         message: str,
         operation: ApplyOperationKind = ApplyOperationKind.APPLY,
     ) -> None: ...

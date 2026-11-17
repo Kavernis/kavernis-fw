@@ -124,7 +124,9 @@ def test_history_and_rollback_preserve_absent_optional_files(
 ) -> None:
     state_service = service(tmp_path)
     write_dhcp_interfaces(state_service)
-    monkeypatch.setattr(network_core, "apply", lambda *_: None)
+    from network_helpers import fake_activation
+
+    monkeypatch.setattr(network_core, "apply", fake_activation)
     state_service.apply()
     first = state_service.store.get_domain_state("network")
     assert first is not None

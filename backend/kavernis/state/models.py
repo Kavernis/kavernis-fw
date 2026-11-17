@@ -64,3 +64,23 @@ class ArtifactDrift:
 
     filename: str
     kind: ArtifactDriftKind
+
+
+class CommitPhase(StrEnum):
+    """Lifecycle of the successful-apply write, not of native activation."""
+
+    BEFORE_TRANSACTION = "before transaction"
+    TRANSACTION_STARTED = "transaction started"
+    COMMIT_ATTEMPTED = "commit attempted; outcome uncertain"
+    COMMITTED = "commit confirmed"
+
+
+@dataclass
+class ApplyCommit:
+    """Shared write receipt, updated by the store even when cancellation escapes.
+
+    Each operation owns one receipt. Only the state store advances its phase;
+    core/backend use it to decide recovery without speculative database reads.
+    """
+
+    phase: CommitPhase = CommitPhase.BEFORE_TRANSACTION

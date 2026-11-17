@@ -6,10 +6,17 @@ import os
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 
+from kavernis.backends.network_runtime import (
+    LinuxNetworkRuntimeInspector,
+    NetworkRuntimeInspector,
+    RuntimeVerificationError,
+    verify_runtime,
+)
 from kavernis.backends.networkd import (
     NetworkdApplyError,
     NetworkdConfiguration,
@@ -32,13 +39,18 @@ from kavernis.config.network import (
     parse_document,
 )
 from kavernis.config.resolver import resolve_network
+from kavernis.core.network_transition import validate_transition
 from kavernis.core.topology import resolve_topology
-from kavernis.state.history import DesiredStateHistory, HistoryError
+from kavernis.models.device import PhysicalSettings
+from kavernis.models.network import NetworkModel
+from kavernis.state.history import DesiredStateHistory
 from kavernis.state.lock import network_lock
 from kavernis.state.models import (
+    ApplyCommit,
     ApplyOperationKind,
     ApplyOutcome,
     ArtifactDrift,
+    CommitPhase,
     HistoryRevision,
 )
 from kavernis.state.sqlite import SQLiteStateStore
@@ -91,7 +103,18 @@ class NetworkStateService:
         paths: NetworkStatePaths = NetworkStatePaths(),
         history: DesiredStateHistory | None = None,
         store: StateStore | None = None,
+        inspector: NetworkRuntimeInspector | None = None,
+        verification_timeout: float = 15.0,
+        reload_timeout: float = 15.0,
     ) -> None:
+        if not all(
+            isfinite(value) and value > 0
+            for value in (verification_timeout, reload_timeout)
+        ):
+            raise ValueError("network timeouts must be positive")
+        self.inspector = inspector or LinuxNetworkRuntimeInspector()
+        self.verification_timeout = verification_timeout
+        self.reload_timeout = reload_timeout
         self.paths = paths
         self.history = history or DesiredStateHistory(paths.history_path)
         self.store = store or SQLiteStateStore(paths.database_path)
@@ -208,22 +231,168 @@ class NetworkStateService:
                 if candidate_path.exists():
                     candidate_path.unlink()
 
+    @contextmanager
+    def _operation(self, operation: ApplyOperationKind) -> Iterator["_Progress"]:
+        progress = _Progress()
+        try:
+            yield progress
+        except BaseException as error:
+            detail = f"{operation.value} stopped during {progress.phase}; " + (
+                "rollback desired state already changed"
+                if progress.desired_changed
+                else "desired state not changed by operation"
+            )
+            error.add_note(detail)
+            if progress.store_ready and progress.commit.phase in (
+                CommitPhase.BEFORE_TRANSACTION,
+                CommitPhase.TRANSACTION_STARTED,
+            ):
+                try:
+                    self.store.record_failed_apply(
+                        NETWORK_DOMAIN,
+                        progress.revision,
+                        "\n".join(
+                            [
+                                str(error) or type(error).__name__,
+                                *getattr(error, "__notes__", []),
+                            ]
+                        ),
+                        operation,
+                    )
+                except BaseException as recording_error:
+                    error.add_note(
+                        f"failure outcome could not be recorded: {recording_error}"
+                    )
+            raise
+
+    def _prepare_transition(
+        self, model: NetworkModel, progress: "_Progress"
+    ) -> NetworkModel | None:
+        self.store.preflight(NETWORK_DOMAIN)
+        progress.store_ready = True
+        applied = self.store.get_domain_state(NETWORK_DOMAIN)
+        previous = None
+        if applied is not None:
+            files = {
+                name: self.history.read_revision(applied.revision, name)
+                for name in self.history.file_names(applied.revision)
+            }
+            desired = desired_from_files(
+                files, "previous successfully applied revision"
+            )
+            previous = _resolve(desired)
+            if artifact_hashes(generate(previous)) != dict(applied.artifact_hashes):
+                raise NetworkdApplyError(
+                    "previous applied revision cannot reproduce recorded artifacts; "
+                    "cannot safely reconstruct the applied baseline"
+                )
+        elif inspect_artifact_drift({}, self.paths.networkd_path):
+            raise NetworkdApplyError(
+                "managed artifacts exist without an applied baseline; reconcile "
+                "the installation in a controlled maintenance environment"
+            )
+        expected = artifact_hashes(generate(previous)) if previous else {}
+        if any(
+            drift.filename.endswith(".netdev") and drift.filename not in expected
+            for drift in inspect_artifact_drift(expected, self.paths.networkd_path)
+        ):
+            raise NetworkdApplyError(
+                "unexpected virtual-device artifact has no applied identity; "
+                "cannot safely retire it through reload"
+            )
+        validate_transition(
+            previous, model, self.inspector.inspect(self.verification_timeout)
+        )
+        return previous
+
+    def _activate(
+        self,
+        candidate: NetworkdConfiguration,
+        model: NetworkModel,
+        previous: NetworkModel | None,
+        revision: str,
+        operation: ApplyOperationKind,
+        progress: "_Progress",
+    ) -> None:
+        recovery_matches = previous is not None and not inspect_artifact_drift(
+            artifact_hashes(generate(previous)), self.paths.networkd_path
+        )
+
+        def verify() -> None:
+            verify_runtime(
+                model,
+                self.inspector,
+                self.paths.networkd_path,
+                previous,
+                timeout=self.verification_timeout,
+            )
+
+        def verify_recovery() -> None:
+            if previous is None or not recovery_matches:
+                raise RuntimeVerificationError(
+                    "no matching previous applied artifact baseline; runtime "
+                    "restoration cannot be verified"
+                )
+            verify_runtime(
+                previous,
+                self.inspector,
+                self.paths.networkd_path,
+                model,
+                timeout=self.verification_timeout,
+            )
+            old_names = {d.name for d in previous.devices}
+            added = {
+                d.name
+                for d in model.devices
+                if not isinstance(d.settings, PhysicalSettings)
+            } - old_names
+            remaining = added & {
+                link.name
+                for link in self.inspector.inspect(self.verification_timeout).links
+            }
+            if remaining:
+                raise RuntimeVerificationError(
+                    f"new devices remain after recovery: {sorted(remaining)}; "
+                    "automatic deletion is unsupported"
+                )
+
+        def record() -> None:
+            self.store.record_successful_apply(
+                NETWORK_DOMAIN,
+                revision,
+                artifact_hashes(candidate),
+                operation,
+                commit=progress.commit,
+            )
+
+        apply(
+            candidate,
+            self.paths.networkd_path,
+            verify=verify,
+            verify_recovery=verify_recovery,
+            record=record,
+            commit=progress.commit,
+            reload_timeout=self.reload_timeout,
+        )
+
     def apply(self) -> NetworkdConfiguration:
-        with self.network_write_transaction():
+        with (
+            self.network_write_transaction(),
+            self._operation(ApplyOperationKind.APPLY) as progress,
+        ):
             desired = load_network(self.paths)
             candidate = plan_network(desired)
             self._require_current(desired.files)
+            model = _resolve(desired)
+            previous = self._prepare_transition(model, progress)
             revision = self.history.snapshot(
                 desired.files, "apply network desired state"
             )
+            progress.revision = revision
             self._require_current(desired.files)
-            try:
-                apply(candidate, self.paths.networkd_path)
-            except NetworkdApplyError as error:
-                self.store.record_failed_apply(NETWORK_DOMAIN, revision, str(error))
-                raise
-            self.store.record_successful_apply(
-                NETWORK_DOMAIN, revision, artifact_hashes(candidate)
+            progress.phase = "native transaction (recovery details below)"
+            self._activate(
+                candidate, model, previous, revision, ApplyOperationKind.APPLY, progress
             )
         return candidate
 
@@ -288,7 +457,10 @@ class NetworkStateService:
         )
 
     def rollback(self, revision: str) -> NetworkdConfiguration:
-        with self.network_write_transaction():
+        with (
+            self.network_write_transaction(),
+            self._operation(ApplyOperationKind.ROLLBACK) as progress,
+        ):
             previous = _read_desired_files(self._desired_paths())
             history_files = set(self.history.file_names(revision))
             if not set(MANDATORY_DESIRED_FILENAMES).issubset(history_files):
@@ -302,6 +474,8 @@ class NetworkStateService:
             }
             desired = desired_from_files(files, f"revision {revision}")
             candidate = plan_network(desired)
+            model = _resolve(desired)
+            applied_model = self._prepare_transition(model, progress)
             # Do not overwrite an uncommitted desired state during recovery. Its
             # exact bytes and optional-resource presence become a normal immutable
             # desired-state revision, never an applied-state revision.
@@ -316,33 +490,37 @@ class NetworkStateService:
                 for filename, contents in files.items()
             }
             self._require_current(previous)
+            progress.phase = "rollback desired-state replacement"
             try:
+                progress.desired_changed = True
                 self._replace_desired_files(written_files)
                 new_revision = self.history.snapshot(
                     written_files, f"rollback network to {revision[:12]}"
                 )
-            except (OSError, HistoryError):
+            except BaseException as error:
                 # Before native activation, restore the prior desired resource set
                 # if a file replacement or history operation failed. Recovery
                 # failures propagate; they must never be silently discarded.
-                self._replace_desired_files(previous)
+                try:
+                    self._replace_desired_files(previous)
+                    progress.desired_changed = False
+                    error.add_note(
+                        "previous desired resources restored; "
+                        "native mutation not started"
+                    )
+                except BaseException as recovery_error:
+                    error.add_note(f"desired-state recovery failed: {recovery_error}")
                 raise
+            progress.revision = new_revision
             self._require_current(written_files)
-            try:
-                apply(candidate, self.paths.networkd_path)
-            except NetworkdApplyError as error:
-                self.store.record_failed_apply(
-                    NETWORK_DOMAIN,
-                    new_revision,
-                    str(error),
-                    ApplyOperationKind.ROLLBACK,
-                )
-                raise
-            self.store.record_successful_apply(
-                NETWORK_DOMAIN,
+            progress.phase = "native transaction (recovery details below)"
+            self._activate(
+                candidate,
+                model,
+                applied_model,
                 new_revision,
-                artifact_hashes(candidate),
                 ApplyOperationKind.ROLLBACK,
+                progress,
             )
         return candidate
 
@@ -359,6 +537,21 @@ class NetworkStateService:
             "network/interfaces.yaml": self.paths.interfaces_path,
             "network/routing.yaml": self.paths.routing_path,
         }
+
+
+@dataclass
+class _Progress:
+    phase: str = "preflight before native mutation"
+    revision: str | None = None
+    desired_changed: bool = False
+    store_ready: bool = False
+    commit: ApplyCommit = field(default_factory=ApplyCommit)
+
+
+def _resolve(desired: NetworkDesiredState) -> NetworkModel:
+    return resolve_topology(
+        resolve_network(desired.devices, desired.interfaces, desired.routing)
+    )
 
 
 def _read_desired_files(paths: Mapping[str, Path]) -> dict[str, bytes]:
@@ -408,8 +601,7 @@ def load_network(paths: NetworkStatePaths) -> NetworkDesiredState:
 
 def plan_network(desired: NetworkDesiredState) -> NetworkdConfiguration:
     """Resolve complete network intent and generate a validated candidate."""
-    model = resolve_network(desired.devices, desired.interfaces, desired.routing)
-    return generate(resolve_topology(model))
+    return generate(_resolve(desired))
 
 
 def _validate_desired_resource(resource: str, contents: bytes) -> None:
@@ -444,11 +636,13 @@ def _write_desired_atomically(path: Path, contents: bytes) -> None:
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)
-    except BaseException:
+    except BaseException as error:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
+        except OSError as cleanup_error:
+            error.add_note(f"temporary-file cleanup failed: {cleanup_error}")
         raise
 
 

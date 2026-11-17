@@ -5,11 +5,13 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from ipaddress import ip_address, ip_interface, ip_network
+from math import isfinite
 from pathlib import Path
 
+from kavernis.backends.network_runtime import effective_onlink
 from kavernis.models.device import BridgeSettings, VLANSettings
 from kavernis.models.interface import (
     InterfaceAddressing,
@@ -18,7 +20,12 @@ from kavernis.models.interface import (
 )
 from kavernis.models.network import NetworkModel
 from kavernis.rendering import render_template
-from kavernis.state.models import ArtifactDrift, ArtifactDriftKind
+from kavernis.state.models import (
+    ApplyCommit,
+    ArtifactDrift,
+    ArtifactDriftKind,
+    CommitPhase,
+)
 
 NETWORKD_FILE_MODE = 0o644
 MANAGED_FILENAME = re.compile(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)")
@@ -113,7 +120,14 @@ def generate(model: NetworkModel) -> NetworkdConfiguration:
             RouteTemplateContext(
                 destination=str(route.network),
                 gateway=str(gateway.address) if gateway.address is not None else None,
-                gateway_onlink="yes" if gateway.onlink else None,
+                gateway_onlink=(
+                    "yes"
+                    if effective_onlink(
+                        next(i for i in model.interfaces if i.id == gateway.interface),
+                        gateway,
+                    )
+                    else None
+                ),
             )
         )
 
@@ -182,18 +196,29 @@ def validate(candidate: NetworkdConfiguration) -> None:
 def apply(
     candidate: NetworkdConfiguration,
     directory: Path = Path("/etc/systemd/network"),
+    *,
+    verify: Callable[[], None] | None = None,
+    verify_recovery: Callable[[], None] | None = None,
+    record: Callable[[], None] | None = None,
+    commit: ApplyCommit | None = None,
+    reload_timeout: float = 15.0,
 ) -> None:
-    """Install a validated candidate and ask systemd-networkd to reload it.
+    """Install/reload within a narrow recovery boundary, then verify and record.
 
-    Only Kavernis-owned files are replaced or removed. If networkctl cannot
-    activate the candidate, the previously managed files are restored before
-    the error is reported.
+    Without callbacks this is an artifact activation primitive, not evidence of
+    runtime convergence. Core supplies verification and durable-record callbacks.
     """
     validate(candidate)
+    if not isfinite(reload_timeout) or reload_timeout <= 0:
+        raise ValueError("reload timeout must be positive")
     try:
         previous = _managed_files_bytes(directory)
     except OSError as error:
         raise NetworkdApplyError(f"cannot read managed artifacts: {error}") from error
+    except BaseException as error:
+        error.add_note("apply interrupted before native mutation; recovery not needed")
+        raise
+    phase = "artifact mutation"
     try:
         directory.mkdir(parents=True, exist_ok=True)
         for filename, content in candidate.files.items():
@@ -201,38 +226,81 @@ def apply(
         for filename in sorted(set(previous) - set(candidate.files)):
             (directory / filename).unlink()
         _sync_directory(directory)
+        phase = "native reload"
         subprocess.run(
-            ["networkctl", "reload"], check=True, capture_output=True, text=True
+            ["networkctl", "reload"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=reload_timeout,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
-        try:
-            _restore(directory, previous)
-        except OSError as restore_error:
-            raise NetworkdApplyError(
-                f"native apply failed ({error}); artifact recovery failed: "
-                f"{restore_error}"
-            ) from restore_error
-        recovery_detail = ""
-        try:
-            recovery = subprocess.run(
-                ["networkctl", "reload"], check=False, capture_output=True, text=True
+        phase = "runtime verification"
+        if verify is not None:
+            verify()
+        phase = "applied-state recording"
+        if record is not None:
+            record()
+    except BaseException as error:
+        # Deliberately narrow: after persistent mutation starts, even cancellation
+        # owes best-effort restoration. Never replace the original cancellation.
+        if commit is not None and commit.phase is CommitPhase.COMMITTED:
+            error.add_note(
+                "interrupted after verified success was durably recorded; "
+                "native configuration and successful outcome retained"
             )
-            if recovery.returncode:
-                recovery_detail = (
-                    "; previous files restored but recovery reload failed: "
-                    f"{recovery.stderr.strip() or recovery.returncode}"
-                )
-        except OSError as recovery_error:
-            recovery_detail = (
-                "; previous files restored but recovery reload failed: "
-                f"{recovery_error}"
+            raise
+        if commit is not None and commit.phase is CommitPhase.COMMIT_ATTEMPTED:
+            error.add_note(
+                "durable recording outcome is uncertain after commit was attempted; "
+                "native recovery not attempted; inspect SQLite and Linux"
             )
-        detail = str(error)
+            raise
+        recovery = _recover(directory, previous, verify_recovery, reload_timeout)
+        detail = f"apply failed during {phase}: {error}; {recovery}"
         if isinstance(error, subprocess.CalledProcessError):
-            detail = str(error.stderr).strip()
-        raise NetworkdApplyError(
-            f"cannot apply networkd configuration: {detail}{recovery_detail}"
-        ) from error
+            detail += f"; {error.stderr}"
+        if isinstance(error, (OSError, subprocess.SubprocessError)):
+            raise NetworkdApplyError(detail) from error
+        error.add_note(detail)
+        raise
+
+
+def _recover(
+    directory: Path,
+    previous: Mapping[str, bytes],
+    verify: Callable[[], None] | None,
+    timeout: float,
+) -> str:
+    """Best effort cleanup, reporting each boundary without losing the cause."""
+    try:
+        _restore(directory, previous)
+    except BaseException as error:
+        return f"artifact recovery failed: {type(error).__name__}: {error}"
+    try:
+        recovery = subprocess.run(
+            ["networkctl", "reload"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if recovery.returncode:
+            return (
+                "previous files restored but recovery reload failed: "
+                f"{recovery.stderr.strip() or recovery.returncode}"
+            )
+    except BaseException as error:
+        return f"previous files restored but recovery reload failed: {error}"
+    if verify is None:
+        return "previous files restored and reloaded; runtime restoration unverified"
+    try:
+        verify()
+    except BaseException as error:
+        return (
+            "previous files restored and reloaded; runtime recovery failed: "
+            f"{type(error).__name__}: {error}"
+        )
+    return "previous files restored; required static runtime restoration verified"
 
 
 def artifact_hashes(candidate: NetworkdConfiguration) -> dict[str, str]:
@@ -298,11 +366,13 @@ def _write_atomically(path: Path, content: str | bytes) -> None:
             os.fsync(temporary.fileno())
         os.chmod(temporary_name, NETWORKD_FILE_MODE)
         os.replace(temporary_name, path)
-    except BaseException:
+    except BaseException as error:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
+        except OSError as cleanup_error:
+            error.add_note(f"temporary-file cleanup failed: {cleanup_error}")
         raise
 
 

@@ -155,3 +155,92 @@ def test_database_read_errors_are_wrapped(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(store, "_after_domain_state_row_read", fail_read)
     with pytest.raises(StateStoreError, match="cannot read"):
         store.get_domain_state("network")
+
+
+def test_preflight_initializes_new_store_and_supports_reads(tmp_path):
+    store = SQLiteStateStore(tmp_path / "state.db")
+    store.preflight("network")
+    assert store.get_domain_state("network") is None
+    assert store.get_last_apply_outcome("network") is None
+    store.record_successful_apply("network", "a" * 40, {})
+    store.preflight("network")
+    assert store.get_domain_state("network").revision == "a" * 40
+
+
+@pytest.mark.parametrize("version", [1, 999])
+def test_preflight_never_migrates_existing_schema(tmp_path, version):
+    store = SQLiteStateStore(tmp_path / "state.db")
+    store.preflight("network")
+    with sqlite3.connect(store.database_path) as db:
+        db.execute("UPDATE schema_version SET version=?", (version,))
+    with pytest.raises(StateStoreError, match="does not migrate"):
+        store.preflight("network")
+    with sqlite3.connect(store.database_path) as db:
+        assert db.execute("SELECT version FROM schema_version").fetchall() == [
+            (version,)
+        ]
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "domain_state",
+        "artifact_hash",
+        "apply_failure",
+        "apply_operation",
+        "schema_version",
+    ],
+)
+def test_preflight_detects_missing_required_tables_even_on_empty_store(tmp_path, table):
+    store = SQLiteStateStore(tmp_path / "state.db")
+    store.preflight("network")
+    with sqlite3.connect(store.database_path) as db:
+        db.execute(f"DROP TABLE {table}")
+    with pytest.raises(StateStoreError):
+        store.preflight("network")
+    with sqlite3.connect(store.database_path) as db:
+        assert not db.execute(
+            "SELECT name FROM sqlite_master WHERE name=?", (table,)
+        ).fetchall()
+
+
+def test_preflight_rejects_corruption_and_duplicate_version_rows(tmp_path):
+    store = SQLiteStateStore(tmp_path / "state.db")
+    store.preflight("network")
+    with sqlite3.connect(store.database_path) as db:
+        db.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
+    with pytest.raises(StateStoreError):
+        store.preflight("network")
+    store.database_path.write_bytes(b"not sqlite")
+    with pytest.raises(StateStoreError):
+        store.preflight("network")
+    assert store.database_path.read_bytes() == b"not sqlite"
+
+
+def test_preflight_checks_supported_reads(tmp_path, monkeypatch):
+    store = SQLiteStateStore(tmp_path / "state.db")
+    store.preflight("network")
+    calls = []
+    monkeypatch.setattr(
+        store, "get_domain_state", lambda domain: calls.append(("state", domain))
+    )
+    monkeypatch.setattr(
+        store,
+        "get_last_apply_outcome",
+        lambda domain: calls.append(("outcome", domain)),
+    )
+    store.preflight("network")
+    assert calls == [("state", "network"), ("outcome", "network")]
+
+
+def test_preflight_rejects_missing_upsert_key_constraint(tmp_path):
+    store = SQLiteStateStore(tmp_path / "state.db")
+    store.preflight("network")
+    with sqlite3.connect(store.database_path) as db:
+        db.execute("DROP TABLE domain_state")
+        db.execute(
+            "CREATE TABLE domain_state (domain TEXT, revision TEXT NOT NULL, "
+            "applied_at TEXT NOT NULL)"
+        )
+    with pytest.raises(StateStoreError, match="key constraints"):
+        store.preflight("network")

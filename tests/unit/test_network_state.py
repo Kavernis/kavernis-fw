@@ -9,7 +9,7 @@ from kavernis.core.network import (
     load_network,
 )
 from kavernis.state.models import ApplyOutcomeKind
-from network_helpers import service, write_desired
+from network_helpers import fake_activation, service, write_desired
 
 
 def test_network_apply_records_network_state_and_detects_all_file_changes(
@@ -18,10 +18,12 @@ def test_network_apply_records_network_state_and_detects_all_file_changes(
     state_service = service(tmp_path)
     write_desired(tmp_path / "etc/network")
 
-    def install(candidate, directory):
+    def install(candidate, directory, **callbacks):
         directory.mkdir(parents=True, exist_ok=True)
         for filename, content in candidate.files.items():
             (directory / filename).write_text(content)
+        callbacks["verify"]()
+        callbacks["record"]()
 
     monkeypatch.setattr(network_core, "apply", install)
     desired = load_network(state_service.paths)
@@ -47,10 +49,12 @@ def test_failed_network_apply_keeps_previous_network_revision(
     state_service = service(tmp_path)
     write_desired(tmp_path / "etc/network")
 
-    def install(candidate, directory) -> None:
+    def install(candidate, directory, **callbacks) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         for filename, content in candidate.files.items():
             (directory / filename).write_text(content)
+        callbacks["verify"]()
+        callbacks["record"]()
 
     monkeypatch.setattr(network_core, "apply", install)
     state_service.apply()
@@ -60,7 +64,7 @@ def test_failed_network_apply_keeps_previous_network_revision(
     monkeypatch.setattr(
         network_core,
         "apply",
-        lambda candidate, directory: (_ for _ in ()).throw(
+        lambda candidate, directory, **callbacks: (_ for _ in ()).throw(
             NetworkdApplyError("reload failed")
         ),
     )
@@ -70,7 +74,7 @@ def test_failed_network_apply_keeps_previous_network_revision(
     outcome = state_service.status(load_network(state_service.paths).files).last_outcome
     assert outcome is not None
     assert outcome.kind is ApplyOutcomeKind.FAILURE
-    assert outcome.message == "reload failed"
+    assert outcome.message.startswith("reload failed")
 
 
 def test_status_keeps_failed_apply_visible_when_artifacts_are_in_sync(
@@ -79,17 +83,19 @@ def test_status_keeps_failed_apply_visible_when_artifacts_are_in_sync(
     state_service = service(tmp_path)
     write_desired(tmp_path / "etc/network")
 
-    def install(candidate, directory) -> None:
+    def install(candidate, directory, **callbacks) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         for filename, content in candidate.files.items():
             (directory / filename).write_text(content)
+        callbacks["verify"]()
+        callbacks["record"]()
 
     monkeypatch.setattr(network_core, "apply", install)
     state_service.apply()
     monkeypatch.setattr(
         network_core,
         "apply",
-        lambda candidate, directory: (_ for _ in ()).throw(
+        lambda candidate, directory, **callbacks: (_ for _ in ()).throw(
             NetworkdApplyError("reload failed")
         ),
     )
@@ -107,19 +113,19 @@ def test_later_successful_apply_replaces_failed_outcome(
 ) -> None:
     state_service = service(tmp_path)
     write_desired(tmp_path / "etc/network")
-    monkeypatch.setattr(network_core, "apply", lambda candidate, directory: None)
+    monkeypatch.setattr(network_core, "apply", fake_activation)
     state_service.apply()
     write_desired(tmp_path / "etc/network", "192.168.20.1/24")
     monkeypatch.setattr(
         network_core,
         "apply",
-        lambda candidate, directory: (_ for _ in ()).throw(
+        lambda candidate, directory, **callbacks: (_ for _ in ()).throw(
             NetworkdApplyError("reload failed")
         ),
     )
     with pytest.raises(NetworkdApplyError):
         state_service.apply()
-    monkeypatch.setattr(network_core, "apply", lambda candidate, directory: None)
+    monkeypatch.setattr(network_core, "apply", fake_activation)
     state_service.apply()
 
     status = state_service.status(load_network(state_service.paths).files)
@@ -131,7 +137,7 @@ def test_network_rollback_restores_all_desired_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     state_service = service(tmp_path)
-    monkeypatch.setattr(network_core, "apply", lambda candidate, directory: None)
+    monkeypatch.setattr(network_core, "apply", fake_activation)
     write_desired(tmp_path / "etc/network")
     state_service.apply()
     first = state_service.store.get_domain_state(NETWORK_DOMAIN)

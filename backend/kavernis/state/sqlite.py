@@ -1,15 +1,18 @@
 """Small explicit SQLite store for Kavernis applied-state metadata."""
 
 import sqlite3
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
 from kavernis.state.models import (
     AppliedDomainState,
+    ApplyCommit,
     ApplyOperationKind,
     ApplyOutcome,
     ApplyOutcomeKind,
+    CommitPhase,
 )
 
 SCHEMA_VERSION = 2
@@ -28,6 +31,87 @@ class SQLiteStateStore:
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
+
+    def preflight(self, domain: str) -> None:
+        """Check an existing store without migration; initialize only a new store.
+
+        This acquires and releases a SQLite write reservation, not a transaction
+        spanning Linux activation. Later writes can still fail.
+        """
+        if not self.database_path.exists():
+            self._initialize()
+        required = {
+            "schema_version": "version",
+            "domain_state": "domain, revision, applied_at",
+            "artifact_hash": "domain, filename, sha256",
+            "apply_failure": "id, domain, revision, failed_at, message",
+            "apply_operation": (
+                "id, domain, operation, outcome, revision, recorded_at, message"
+            ),
+        }
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                versions = connection.execute(
+                    "SELECT version FROM schema_version"
+                ).fetchall()
+                if versions != [(SCHEMA_VERSION,)]:
+                    raise StateSchemaError(
+                        f"unsupported Kavernis state schema {versions}; "
+                        f"expected version {SCHEMA_VERSION}; apply does not migrate"
+                    )
+                for table, columns in required.items():
+                    # Identifiers are fixed internal constants, never user input.
+                    connection.execute(f"SELECT {columns} FROM {table} LIMIT 0")
+                constraints = {
+                    "domain_state": (("domain",),),
+                    "artifact_hash": (("domain", "filename"),),
+                    "apply_failure": (("id",),),
+                    "apply_operation": (("id",),),
+                }
+                for table, expected_keys in constraints.items():
+                    actual_keys: set[tuple[str, ...]] = set()
+                    for index in connection.execute(
+                        f"PRAGMA index_list({table})"
+                    ).fetchall():
+                        if not index[2]:
+                            continue
+                        indexed_columns: tuple[str, ...] = tuple(
+                            str(row[2])
+                            for row in connection.execute(
+                                f"PRAGMA index_info({index[1]})"
+                            ).fetchall()
+                        )
+                        if columns:
+                            actual_keys.add(indexed_columns)
+                    primary_key = tuple(
+                        name
+                        for _, name in sorted(
+                            (row[5], row[1])
+                            for row in connection.execute(
+                                f"PRAGMA table_info({table})"
+                            ).fetchall()
+                            if row[5]
+                        )
+                    )
+                    if primary_key:
+                        actual_keys.add(primary_key)
+                    if not set(expected_keys) <= actual_keys:
+                        raise StateSchemaError(
+                            f"incompatible {table} key constraints: "
+                            f"expected {expected_keys}, observed {sorted(actual_keys)}"
+                        )
+                if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    raise StateStoreError("Kavernis state integrity check failed")
+                if connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise StateStoreError("Kavernis state foreign-key check failed")
+                connection.rollback()
+            self.get_domain_state(domain)
+            self.get_last_apply_outcome(domain)
+        except (sqlite3.Error, ValueError, OSError) as error:
+            raise StateStoreError(
+                f"Kavernis state preflight failed: {error}"
+            ) from error
 
     def get_domain_state(self, domain: str) -> AppliedDomainState | None:
         self._initialize()
@@ -89,53 +173,96 @@ class SQLiteStateStore:
         revision: str,
         artifact_hashes: Mapping[str, str],
         operation: ApplyOperationKind = ApplyOperationKind.APPLY,
+        *,
+        commit: ApplyCommit | None = None,
     ) -> None:
-        self._initialize()
-        applied_at = datetime.now(UTC).isoformat()
+        receipt = commit if commit is not None else ApplyCommit()
+        if receipt.phase is not CommitPhase.BEFORE_TRANSACTION:
+            raise ValueError("successful-apply receipt must not be reused")
+        connection: sqlite3.Connection | None = None
         try:
-            with self._connect() as connection:
-                with connection:
-                    connection.execute(
-                        "INSERT INTO domain_state(domain, revision, applied_at) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(domain) DO UPDATE SET "
-                        "revision = excluded.revision, "
-                        "applied_at = excluded.applied_at",
-                        (domain, revision, applied_at),
-                    )
-                    connection.execute(
-                        "DELETE FROM artifact_hash WHERE domain = ?", (domain,)
-                    )
-                    connection.executemany(
-                        "INSERT INTO artifact_hash(domain, filename, sha256) "
-                        "VALUES (?, ?, ?)",
-                        [
-                            (domain, filename, sha256)
-                            for filename, sha256 in sorted(artifact_hashes.items())
-                        ],
-                    )
-                    self._record_outcome(
-                        connection,
-                        domain,
-                        operation,
-                        ApplyOutcomeKind.SUCCESS,
-                        revision,
-                        None,
-                        applied_at,
-                    )
-        except sqlite3.Error as error:
-            raise StateStoreError(
-                f"cannot record applied Kavernis state: {error}"
-            ) from error
+            self._initialize()
+            connection = self._connect()
+            connection.execute("BEGIN IMMEDIATE")
+            receipt.phase = CommitPhase.TRANSACTION_STARTED
+            self._write_success(
+                connection, domain, revision, artifact_hashes, operation
+            )
+            self._before_success_commit()
+            receipt.phase = CommitPhase.COMMIT_ATTEMPTED
+            connection.commit()
+            receipt.phase = CommitPhase.COMMITTED
+            self._after_success_commit()
+        except BaseException as error:
+            if connection is not None and receipt.phase is not CommitPhase.COMMITTED:
+                try:
+                    connection.rollback()
+                except BaseException as rollback_error:
+                    error.add_note(f"SQLite rollback failed: {rollback_error}")
+            if isinstance(error, sqlite3.Error):
+                raise StateStoreError(
+                    f"cannot record applied Kavernis state: {error}"
+                ) from error
+            raise
+        finally:
+            if connection is not None:
+                original = sys.exception()
+                try:
+                    connection.close()
+                except BaseException as close_error:
+                    if original is None:
+                        raise
+                    original.add_note(f"SQLite close failed: {close_error}")
+
+    def _before_success_commit(self) -> None:
+        """Failure-injection seam after writes, before commit is attempted."""
+
+    def _after_success_commit(self) -> None:
+        """Failure-injection seam after the durable success is acknowledged."""
+
+    def _write_success(
+        self,
+        connection: sqlite3.Connection,
+        domain: str,
+        revision: str,
+        artifact_hashes: Mapping[str, str],
+        operation: ApplyOperationKind,
+    ) -> None:
+        applied_at = datetime.now(UTC).isoformat()
+        connection.execute(
+            "INSERT INTO domain_state(domain, revision, applied_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(domain) DO UPDATE SET revision = excluded.revision, "
+            "applied_at = excluded.applied_at",
+            (domain, revision, applied_at),
+        )
+        connection.execute("DELETE FROM artifact_hash WHERE domain = ?", (domain,))
+        connection.executemany(
+            "INSERT INTO artifact_hash(domain, filename, sha256) VALUES (?, ?, ?)",
+            [
+                (domain, filename, sha256)
+                for filename, sha256 in sorted(artifact_hashes.items())
+            ],
+        )
+        self._record_outcome(
+            connection,
+            domain,
+            operation,
+            ApplyOutcomeKind.SUCCESS,
+            revision,
+            None,
+            applied_at,
+        )
 
     def record_failed_apply(
         self,
         domain: str,
-        revision: str,
+        revision: str | None,
         message: str,
         operation: ApplyOperationKind = ApplyOperationKind.APPLY,
     ) -> None:
         self._initialize()
+        # The legacy failure table requires a string; the typed operation row
+        # records NULL when preflight failed before identifying a revision.
         failed_at = datetime.now(UTC).isoformat()
         try:
             with self._connect() as connection:
@@ -144,7 +271,7 @@ class SQLiteStateStore:
                         "INSERT INTO apply_failure(domain, revision, failed_at, "
                         "message) "
                         "VALUES (?, ?, ?, ?)",
-                        (domain, revision, failed_at, message),
+                        (domain, revision or "", failed_at, message),
                     )
                     self._record_outcome(
                         connection,
@@ -254,6 +381,4 @@ class SQLiteStateStore:
             "SELECT domain, 'apply', 'failure', revision, failed_at, message "
             "FROM apply_failure ORDER BY id"
         )
-        connection.execute(
-            "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
-        )
+        connection.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))

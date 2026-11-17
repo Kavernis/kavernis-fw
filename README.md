@@ -199,8 +199,15 @@ validates before writing, atomically replaces each owned artifact with mode
 `0644`, removes obsolete owned artifacts, and runs `networkctl reload`.
 Artifact names are `10-kavernis-<device-id>.network` and, for VLANs and bridges,
 `10-kavernis-<device-id>.netdev`. Unrelated networkd files are left untouched.
-A failed native apply attempts to restore the prior managed files and reload.
-This does not guarantee live connectivity recovery.
+Apply now checks SQLite readiness and the last applied Git topology before native
+mutation, then verifies required static Linux state after reload before recording
+success. DHCP/SLAAC acquisition and external connectivity are separate from this
+activation guarantee. Unsupported device replacement/removal is rejected before
+mutation, including during rollback. A failed or interrupted native transaction
+attempts file restoration, reload and bounded runtime verification where a known
+baseline exists. This does not guarantee live connectivity recovery. See
+[network application safety](docs/network-application-safety.md) for exact checks,
+recovery limits and integration-test instructions.
 
 ## State and recovery
 
@@ -246,8 +253,10 @@ before using an existing installation with this layout.
 PYTHONPATH=backend .venv/bin/python scripts/generate_network_schemas.py
 ```
 
-Tests use temporary configuration, native, history and database paths. Native
-reloads are mocked; tests never change the developer host's networking.
+Unit tests use temporary configuration, native, history and database paths,
+mocked reloads and explicit runtime observations. Opt-in integration tests require
+an isolated network namespace or an explicitly designated disposable VM; they
+are skipped in the normal test suite.
 
 The implementation covers physical/VLAN/bridge devices, logical L3 interfaces,
 existing IP client/addressing modes, static routing, editing, history, state and
