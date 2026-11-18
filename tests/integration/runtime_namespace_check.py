@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "backend"))
@@ -21,6 +22,8 @@ from kavernis.models.device import (  # noqa: E402
 )
 from kavernis.models.network import NetworkModel  # noqa: E402
 
+ORIGINAL_NETNS_ENV = "KAVERNIS_ORIGINAL_NETNS"
+
 
 def ip(*args):
     return subprocess.run(
@@ -28,10 +31,22 @@ def ip(*args):
     ).stdout
 
 
-def main():
-    # Refuse direct execution in the host namespace, even if invoked by mistake.
-    if os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net"):
+def require_isolated_network_namespace(
+    environment: Mapping[str, str],
+    readlink: Callable[[str], str] = os.readlink,
+) -> None:
+    """Refuse kernel changes unless unshare created a distinct network namespace."""
+    original_namespace = environment.get(ORIGINAL_NETNS_ENV)
+    if not original_namespace:
+        raise RuntimeError("original network namespace identity is required")
+    if readlink("/proc/self/ns/net") == original_namespace:
         raise RuntimeError("must run in an isolated network namespace")
+
+
+def main():
+    # This guard runs before any kernel mutation.  The parent captures its
+    # namespace identity before unshare, so the child never needs /proc/1.
+    require_isolated_network_namespace(os.environ)
     ip("link", "add", "kv-a", "type", "veth", "peer", "name", "kv-b")
     ip("link", "add", "link", "kv-a", "name", "kv-vlan", "type", "vlan", "id", "30")
     ip("link", "add", "kv-br", "type", "bridge", "stp_state", "0")

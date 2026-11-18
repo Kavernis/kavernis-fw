@@ -26,9 +26,12 @@ def test_kernel_observations_in_disposable_user_network_namespace():
     if probe.returncode:
         pytest.skip(f"user/network namespaces unavailable: {probe.stderr.strip()}")
     script = Path(__file__).with_name("runtime_namespace_check.py")
+    environment = os.environ.copy()
+    environment["KAVERNIS_ORIGINAL_NETNS"] = os.readlink("/proc/self/ns/net")
     result = subprocess.run(
         ["unshare", "--user", "--map-root-user", "--net", sys.executable, str(script)],
         capture_output=True,
+        env=environment,
         text=True,
         timeout=15,
     )
