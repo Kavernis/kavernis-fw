@@ -185,3 +185,39 @@ been executed in this environment. Normal `pytest` skips both opt-in integration
 Real networkd reconfiguration, timing under load, dynamic-policy acceptance and
 remote connectivity remain unvalidated operational assumptions until these tests
 and broader disposable-host scenarios run successfully.
+
+Recovery has separate real-networkd scenarios. Run them only on that same kind
+of disposable VM:
+
+```sh
+sudo env KAVERNIS_DISPOSABLE_NETWORKD_VM=1 .venv/bin/pytest -q \
+  tests/integration/test_networkd_recovery_vm.py -rs
+```
+
+Each case creates one uniquely named veth pair (`kv-rec-a`, `kv-rec-b`, or
+`kv-rec-c`) and one matching, test-owned artifact in `/run/systemd/network`.
+It uses temporary desired YAML, Git history, SQLite and lock paths. Setup refuses
+existing names/artifacts; cleanup removes only those exact names and reloads
+networkd. The marker, opt-in variable, root, VM detection and active
+`systemd-networkd` gates all remain mandatory.
+
+The recovery cases deliberately keep networkd real. They use only narrow
+in-process seams after native mutation:
+
+* Scenario A raises from the core runtime-verification callback after candidate
+  artifacts have been installed and reloaded. It proves exact artifact-byte/hash
+  restoration, a second real reload, restoration of the prior static address and
+  per-device routes/setup state, unchanged successful SQLite revision, and a
+  separately recorded failure outcome.
+* Scenario B raises from SQLite's `_before_success_commit` hook. The hook first
+  observes that the new static address is active, then fails before commit. It
+  proves that native convergence alone does not advance applied state and that
+  normal recovery restores the former artifacts and kernel state while recording
+  failure separately.
+* Scenario C raises `KeyboardInterrupt` from `_after_success_commit`, after the
+  durable successful record. The interruption remains visible to the caller, but
+  recovery is correctly not run: the new artifacts/address and successful SQLite
+  revision remain, and no failure row is added.
+
+These tests do not prove DHCP lease acquisition, external reachability,
+crash/power-loss recovery, or recovery from an indeterminate SQLite commit.
