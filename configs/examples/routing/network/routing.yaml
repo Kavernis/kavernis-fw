@@ -1,0 +1,29 @@
+version: 2
+
+gateways:
+  - id: main-router
+    interface: lan
+    address: 192.168.10.254
+  - id: router-v6
+    interface: lan
+    address: 2001:db8:10::fe
+  - id: direct
+    interface: lan
+  - id: remote-router
+    interface: lan
+    address: 10.200.0.1
+    onlink: true
+
+routes:
+  - id: default-v4
+    network: 0.0.0.0/0
+    gateway: main-router
+  - id: default-v6
+    network: ::/0
+    gateway: router-v6
+  - id: direct-network
+    network: 10.50.0.0/16
+    gateway: direct
+  - id: other-network
+    network: 10.100.0.0/16
+    gateway: remote-router

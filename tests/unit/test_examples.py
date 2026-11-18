@@ -1,29 +1,34 @@
-"""Repository example configuration conventions."""
+"""Every documented example is a complete, independently plannable network."""
 
-import re
 from pathlib import Path
 
-from kavernis.config.loader import (
-    load_gateways,
-    load_interfaces,
-    load_routes,
-)
+import pytest
+from kavernis.core.network import NetworkStatePaths, load_network, plan_network
+
+EXAMPLES = sorted(Path("configs/examples").glob("*/network"))
 
 
-def test_examples_use_yaml_extension_and_parse() -> None:
-    examples = Path("configs/examples")
+@pytest.mark.parametrize("directory", EXAMPLES, ids=lambda path: path.parent.name)
+def test_complete_example_loads_and_plans_without_writes(directory):
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+    paths = NetworkStatePaths(
+        devices_path=directory / "devices.yaml",
+        interfaces_path=directory / "interfaces.yaml",
+        routing_path=directory / "routing.yaml",
+    )
+    candidate = plan_network(load_network(paths))
+    assert candidate.files
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
 
-    assert not list(examples.glob("*.yml"))
-    assert load_interfaces(examples / "interfaces.yaml")
-    assert load_interfaces(examples / "interfaces-dhcp-only.yaml")
-    assert load_interfaces(examples / "interfaces-dhcp-options.yaml")
-    assert load_interfaces(examples / "interfaces-vlan.yaml")
-    assert load_interfaces(examples / "interfaces-bridge.yaml")
-    assert load_interfaces(examples / "interfaces-routing.yaml")
-    assert load_gateways(examples / "gateways.yaml")
-    assert load_routes(examples / "routes.yaml")
 
-
-def test_readme_has_no_stale_example_yml_references() -> None:
-    readme = Path("README.md").read_text()
-    assert not re.search(r"configs/examples/[^\s)`]+\.yml\b", readme)
+def test_examples_cover_all_documented_variants():
+    assert {path.parent.name for path in EXAMPLES} == {
+        "vlans",
+        "bridge",
+        "routing",
+        "dhcp",
+        "dhcp-options",
+        "dual-stack",
+    }
+    assert not list(Path("configs/examples").rglob("*.yml"))
+    assert not (Path("configs/examples/vlans/network/routing.yaml")).exists()

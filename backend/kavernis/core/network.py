@@ -4,12 +4,19 @@ import difflib
 import hashlib
 import os
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 
+from kavernis.backends.network_runtime import (
+    LinuxNetworkRuntimeInspector,
+    NetworkRuntimeInspector,
+    RuntimeVerificationError,
+    verify_runtime,
+)
 from kavernis.backends.networkd import (
     NetworkdApplyError,
     NetworkdConfiguration,
@@ -19,26 +26,38 @@ from kavernis.backends.networkd import (
     inspect_artifact_drift,
 )
 from kavernis.config.errors import ConfigurationError
-from kavernis.config.gateways import GatewaysConfig
-from kavernis.config.interfaces import InterfacesConfig
-from kavernis.config.loader import (
-    load_gateways_contents,
-    load_interfaces_contents,
-    load_routes_contents,
+from kavernis.config.layout import (
+    DESIRED_FILENAMES,
+    MANDATORY_DESIRED_FILENAMES,
+    NetworkDesiredState,
+    desired_from_files,
+)
+from kavernis.config.network import (
+    DevicesConfig,
+    LogicalInterfacesConfig,
+    RoutingConfig,
+    parse_document,
 )
 from kavernis.config.resolver import resolve_network
-from kavernis.config.routes import RoutesConfig
+from kavernis.core.network_transition import validate_transition
+from kavernis.core.topology import resolve_topology
+from kavernis.models.device import PhysicalSettings
+from kavernis.models.network import NetworkModel
 from kavernis.state.history import DesiredStateHistory
 from kavernis.state.lock import network_lock
-from kavernis.state.models import ArtifactDrift, HistoryRevision
+from kavernis.state.models import (
+    ApplyCommit,
+    ApplyOperationKind,
+    ApplyOutcome,
+    ArtifactDrift,
+    CommitPhase,
+    HistoryRevision,
+)
 from kavernis.state.sqlite import SQLiteStateStore
 from kavernis.state.store import StateStore
 
 NETWORK_DOMAIN = "network"
-DESIRED_FILENAMES = ("interfaces.yaml", "gateways.yaml", "routes.yaml")
-MANDATORY_DESIRED_FILENAMES = ("interfaces.yaml",)
-OPTIONAL_DESIRED_FILENAMES = ("gateways.yaml", "routes.yaml")
-EDITABLE_RESOURCES = ("interfaces", "gateways", "routes")
+EDITABLE_RESOURCES = ("devices", "interfaces", "routing")
 
 
 class DesiredStateChangedError(RuntimeError):
@@ -62,23 +81,14 @@ class NetworkStatus:
     desired_revision: str | None
     applied_revision: str | None
     drift: tuple[ArtifactDrift, ...]
-
-
-@dataclass(frozen=True)
-class NetworkDesiredState:
-    """Complete desired input for one atomic network transaction."""
-
-    interfaces: InterfacesConfig
-    gateways: GatewaysConfig
-    routes: RoutesConfig
-    files: dict[str, bytes]
+    last_outcome: ApplyOutcome | None
 
 
 @dataclass(frozen=True)
 class NetworkStatePaths:
-    interfaces_path: Path = Path("/etc/kavernis/interfaces.yaml")
-    gateways_path: Path = Path("/etc/kavernis/gateways.yaml")
-    routes_path: Path = Path("/etc/kavernis/routes.yaml")
+    devices_path: Path = Path("/etc/kavernis/network/devices.yaml")
+    interfaces_path: Path = Path("/etc/kavernis/network/interfaces.yaml")
+    routing_path: Path = Path("/etc/kavernis/network/routing.yaml")
     history_path: Path = Path("/var/lib/kavernis/history")
     database_path: Path = Path("/var/lib/kavernis/state.db")
     networkd_path: Path = Path("/etc/systemd/network")
@@ -93,7 +103,18 @@ class NetworkStateService:
         paths: NetworkStatePaths = NetworkStatePaths(),
         history: DesiredStateHistory | None = None,
         store: StateStore | None = None,
+        inspector: NetworkRuntimeInspector | None = None,
+        verification_timeout: float = 15.0,
+        reload_timeout: float = 15.0,
     ) -> None:
+        if not all(
+            isfinite(value) and value > 0
+            for value in (verification_timeout, reload_timeout)
+        ):
+            raise ValueError("network timeouts must be positive")
+        self.inspector = inspector or LinuxNetworkRuntimeInspector()
+        self.verification_timeout = verification_timeout
+        self.reload_timeout = reload_timeout
         self.paths = paths
         self.history = history or DesiredStateHistory(paths.history_path)
         self.store = store or SQLiteStateStore(paths.database_path)
@@ -116,14 +137,13 @@ class NetworkStateService:
         remains distinct here: creating or deleting it while an editor is open
         must be detected as a concurrent desired-state change.
         """
-        return {
-            filename: (
-                f"present:{hashlib.sha256(path.read_bytes()).hexdigest()}"
-                if path.exists()
-                else "absent"
+        return _fingerprint_files(_read_desired_files(self._desired_paths()))
+
+    def _require_current(self, files: Mapping[str, bytes]) -> None:
+        if self.desired_fingerprint() != _fingerprint_files(files):
+            raise DesiredStateChangedError(
+                "Network desired state changed externally; reload and retry."
             )
-            for filename, path in self._desired_paths().items()
-        }
 
     def replace_desired_resource(
         self,
@@ -211,33 +231,182 @@ class NetworkStateService:
                 if candidate_path.exists():
                     candidate_path.unlink()
 
-    def apply(
-        self, desired: NetworkDesiredState | None = None
-    ) -> NetworkdConfiguration:
-        # ``desired`` remains accepted for compatibility.  Reload under the lock
-        # so the candidate, history snapshot, and native apply use one revision.
-        with self.network_write_transaction():
+    @contextmanager
+    def _operation(self, operation: ApplyOperationKind) -> Iterator["_Progress"]:
+        progress = _Progress()
+        try:
+            yield progress
+        except BaseException as error:
+            detail = f"{operation.value} stopped during {progress.phase}; " + (
+                "rollback desired state already changed"
+                if progress.desired_changed
+                else "desired state not changed by operation"
+            )
+            error.add_note(detail)
+            if progress.store_ready and progress.commit.phase in (
+                CommitPhase.BEFORE_TRANSACTION,
+                CommitPhase.TRANSACTION_STARTED,
+            ):
+                try:
+                    self.store.record_failed_apply(
+                        NETWORK_DOMAIN,
+                        progress.revision,
+                        "\n".join(
+                            [
+                                str(error) or type(error).__name__,
+                                *getattr(error, "__notes__", []),
+                            ]
+                        ),
+                        operation,
+                    )
+                except BaseException as recording_error:
+                    error.add_note(
+                        f"failure outcome could not be recorded: {recording_error}"
+                    )
+            raise
+
+    def _prepare_transition(
+        self, model: NetworkModel, progress: "_Progress"
+    ) -> NetworkModel | None:
+        self.store.preflight(NETWORK_DOMAIN)
+        progress.store_ready = True
+        applied = self.store.get_domain_state(NETWORK_DOMAIN)
+        previous = None
+        if applied is not None:
+            files = {
+                name: self.history.read_revision(applied.revision, name)
+                for name in self.history.file_names(applied.revision)
+            }
+            desired = desired_from_files(
+                files, "previous successfully applied revision"
+            )
+            previous = _resolve(desired)
+            if artifact_hashes(generate(previous)) != dict(applied.artifact_hashes):
+                raise NetworkdApplyError(
+                    "previous applied revision cannot reproduce recorded artifacts; "
+                    "cannot safely reconstruct the applied baseline"
+                )
+        elif inspect_artifact_drift({}, self.paths.networkd_path):
+            raise NetworkdApplyError(
+                "managed artifacts exist without an applied baseline; reconcile "
+                "the installation in a controlled maintenance environment"
+            )
+        expected = artifact_hashes(generate(previous)) if previous else {}
+        if any(
+            drift.filename.endswith(".netdev") and drift.filename not in expected
+            for drift in inspect_artifact_drift(expected, self.paths.networkd_path)
+        ):
+            raise NetworkdApplyError(
+                "unexpected virtual-device artifact has no applied identity; "
+                "cannot safely retire it through reload"
+            )
+        validate_transition(
+            previous, model, self.inspector.inspect(self.verification_timeout)
+        )
+        return previous
+
+    def _activate(
+        self,
+        candidate: NetworkdConfiguration,
+        model: NetworkModel,
+        previous: NetworkModel | None,
+        revision: str,
+        operation: ApplyOperationKind,
+        progress: "_Progress",
+    ) -> None:
+        recovery_matches = previous is not None and not inspect_artifact_drift(
+            artifact_hashes(generate(previous)), self.paths.networkd_path
+        )
+
+        def verify() -> None:
+            verify_runtime(
+                model,
+                self.inspector,
+                self.paths.networkd_path,
+                previous,
+                timeout=self.verification_timeout,
+            )
+
+        def verify_recovery() -> None:
+            if previous is None or not recovery_matches:
+                raise RuntimeVerificationError(
+                    "no matching previous applied artifact baseline; runtime "
+                    "restoration cannot be verified"
+                )
+            verify_runtime(
+                previous,
+                self.inspector,
+                self.paths.networkd_path,
+                model,
+                timeout=self.verification_timeout,
+            )
+            old_names = {d.name for d in previous.devices}
+            added = {
+                d.name
+                for d in model.devices
+                if not isinstance(d.settings, PhysicalSettings)
+            } - old_names
+            remaining = added & {
+                link.name
+                for link in self.inspector.inspect(self.verification_timeout).links
+            }
+            if remaining:
+                raise RuntimeVerificationError(
+                    f"new devices remain after recovery: {sorted(remaining)}; "
+                    "automatic deletion is unsupported"
+                )
+
+        def record() -> None:
+            self.store.record_successful_apply(
+                NETWORK_DOMAIN,
+                revision,
+                artifact_hashes(candidate),
+                operation,
+                commit=progress.commit,
+            )
+
+        apply(
+            candidate,
+            self.paths.networkd_path,
+            verify=verify,
+            verify_recovery=verify_recovery,
+            record=record,
+            commit=progress.commit,
+            reload_timeout=self.reload_timeout,
+        )
+
+    def apply(self) -> NetworkdConfiguration:
+        with (
+            self.network_write_transaction(),
+            self._operation(ApplyOperationKind.APPLY) as progress,
+        ):
             desired = load_network(self.paths)
             candidate = plan_network(desired)
+            self._require_current(desired.files)
+            model = _resolve(desired)
+            previous = self._prepare_transition(model, progress)
             revision = self.history.snapshot(
                 desired.files, "apply network desired state"
             )
-            try:
-                apply(candidate, self.paths.networkd_path)
-            except NetworkdApplyError as error:
-                self.store.record_failed_apply(NETWORK_DOMAIN, revision, str(error))
-                raise
-            self.store.record_successful_apply(
-                NETWORK_DOMAIN, revision, artifact_hashes(candidate)
+            progress.revision = revision
+            self._require_current(desired.files)
+            progress.phase = "native transaction (recovery details below)"
+            self._activate(
+                candidate, model, previous, revision, ApplyOperationKind.APPLY, progress
             )
         return candidate
 
     def status(self, files: dict[str, bytes]) -> NetworkStatus:
         desired_revision = self.history.revision_for_contents(files)
         applied = self.store.get_domain_state(NETWORK_DOMAIN)
+        last_outcome = self.store.get_last_apply_outcome(NETWORK_DOMAIN)
         if applied is None:
             return NetworkStatus(
-                NetworkStatusKind.NOT_YET_APPLIED, desired_revision, None, ()
+                NetworkStatusKind.NOT_YET_APPLIED,
+                desired_revision,
+                None,
+                (),
+                last_outcome,
             )
         if desired_revision != applied.revision:
             matches = desired_revision is None and self.history.contents_match(
@@ -249,6 +418,7 @@ class NetworkStateService:
                     desired_revision,
                     applied.revision,
                     (),
+                    last_outcome,
                 )
             desired_revision = applied.revision
         drift = inspect_artifact_drift(
@@ -259,6 +429,7 @@ class NetworkStateService:
             desired_revision,
             applied.revision,
             drift,
+            last_outcome,
         )
 
     def history_revisions(self) -> list[HistoryRevision]:
@@ -286,112 +457,163 @@ class NetworkStateService:
         )
 
     def rollback(self, revision: str) -> NetworkdConfiguration:
-        with self.network_write_transaction():
+        with (
+            self.network_write_transaction(),
+            self._operation(ApplyOperationKind.ROLLBACK) as progress,
+        ):
+            previous = _read_desired_files(self._desired_paths())
             history_files = set(self.history.file_names(revision))
-            if "interfaces.yaml" not in history_files:
+            if not set(MANDATORY_DESIRED_FILENAMES).issubset(history_files):
                 raise ConfigurationError(
-                    f"revision {revision} does not contain mandatory interfaces.yaml"
+                    f"revision {revision} does not contain mandatory network resources"
                 )
             files = {
                 filename: self.history.read_revision(revision, filename)
                 for filename in DESIRED_FILENAMES
                 if filename in history_files
             }
-            desired = _desired_from_files(files, f"revision {revision}")
+            desired = desired_from_files(files, f"revision {revision}")
             candidate = plan_network(desired)
+            model = _resolve(desired)
+            applied_model = self._prepare_transition(model, progress)
+            # Do not overwrite an uncommitted desired state during recovery. Its
+            # exact bytes and optional-resource presence become a normal immutable
+            # desired-state revision, never an applied-state revision.
+            outgoing = desired_from_files(previous, "current network configuration")
+            plan_network(outgoing)
+            if self.history.revision_for_contents(previous) is None:
+                self.history.snapshot(
+                    previous, "preserve network desired state before rollback"
+                )
             written_files = {
                 filename: _with_desired_header(_filename_resource(filename), contents)
                 for filename, contents in files.items()
             }
-            for filename, path in self._desired_paths().items():
-                if filename in written_files:
-                    _write_desired_atomically(path, written_files[filename])
-                elif filename in OPTIONAL_DESIRED_FILENAMES:
-                    _remove_desired(path)
-            new_revision = self.history.snapshot(
-                written_files, f"rollback network to {revision[:12]}"
-            )
+            self._require_current(previous)
+            progress.phase = "rollback desired-state replacement"
             try:
-                apply(candidate, self.paths.networkd_path)
-            except NetworkdApplyError as error:
-                self.store.record_failed_apply(NETWORK_DOMAIN, new_revision, str(error))
+                progress.desired_changed = True
+                self._replace_desired_files(written_files)
+                new_revision = self.history.snapshot(
+                    written_files, f"rollback network to {revision[:12]}"
+                )
+            except BaseException as error:
+                # Before native activation, restore the prior desired resource set
+                # if a file replacement or history operation failed. Recovery
+                # failures propagate; they must never be silently discarded.
+                try:
+                    self._replace_desired_files(previous)
+                    progress.desired_changed = False
+                    error.add_note(
+                        "previous desired resources restored; "
+                        "native mutation not started"
+                    )
+                except BaseException as recovery_error:
+                    error.add_note(f"desired-state recovery failed: {recovery_error}")
                 raise
-            self.store.record_successful_apply(
-                NETWORK_DOMAIN, new_revision, artifact_hashes(candidate)
+            progress.revision = new_revision
+            self._require_current(written_files)
+            progress.phase = "native transaction (recovery details below)"
+            self._activate(
+                candidate,
+                model,
+                applied_model,
+                new_revision,
+                ApplyOperationKind.ROLLBACK,
+                progress,
             )
         return candidate
 
+    def _replace_desired_files(self, files: Mapping[str, bytes]) -> None:
+        for filename, path in self._desired_paths().items():
+            if filename in files:
+                _write_desired_atomically(path, files[filename])
+            else:
+                _remove_desired(path)
+
     def _desired_paths(self) -> dict[str, Path]:
         return {
-            "interfaces.yaml": self.paths.interfaces_path,
-            "gateways.yaml": self.paths.gateways_path,
-            "routes.yaml": self.paths.routes_path,
+            "network/devices.yaml": self.paths.devices_path,
+            "network/interfaces.yaml": self.paths.interfaces_path,
+            "network/routing.yaml": self.paths.routing_path,
         }
 
 
+@dataclass
+class _Progress:
+    phase: str = "preflight before native mutation"
+    revision: str | None = None
+    desired_changed: bool = False
+    store_ready: bool = False
+    commit: ApplyCommit = field(default_factory=ApplyCommit)
+
+
+def _resolve(desired: NetworkDesiredState) -> NetworkModel:
+    return resolve_topology(
+        resolve_network(desired.devices, desired.interfaces, desired.routing)
+    )
+
+
+def _read_desired_files(paths: Mapping[str, Path]) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    for filename, path in paths.items():
+        try:
+            files[filename] = path.read_bytes()
+        except FileNotFoundError:
+            continue
+    return files
+
+
+def _fingerprint_files(files: Mapping[str, bytes]) -> dict[str, str]:
+    return {
+        filename: (
+            f"present:{hashlib.sha256(files[filename]).hexdigest()}"
+            if filename in files
+            else "absent"
+        )
+        for filename in DESIRED_FILENAMES
+    }
+
+
 def load_network(paths: NetworkStatePaths) -> NetworkDesiredState:
-    """Load mandatory and optional network desired state without side effects."""
-    try:
-        interfaces = paths.interfaces_path.read_bytes()
-    except OSError as error:
-        raise ConfigurationError(
-            f"cannot load mandatory interfaces configuration "
-            f"{paths.interfaces_path}: {error}"
-        ) from error
-    files = {"interfaces.yaml": interfaces}
-    for filename, path in (
-        ("gateways.yaml", paths.gateways_path),
-        ("routes.yaml", paths.routes_path),
+    """Load the sole supported layout, preserving optional file presence."""
+    files: dict[str, bytes] = {}
+    for filename, path in zip(
+        DESIRED_FILENAMES,
+        (
+            paths.devices_path,
+            paths.interfaces_path,
+            paths.routing_path,
+        ),
+        strict=True,
     ):
-        if path.exists():
-            try:
-                files[filename] = path.read_bytes()
-            except OSError as error:
+        try:
+            files[filename] = path.read_bytes()
+        except FileNotFoundError as error:
+            if filename in MANDATORY_DESIRED_FILENAMES:
                 raise ConfigurationError(
-                    f"cannot load optional {filename} configuration {path}: {error}"
+                    f"cannot load mandatory {filename}: {error}"
                 ) from error
-    return _desired_from_files(files, "network configuration")
+        except OSError as error:
+            raise ConfigurationError(f"cannot load {filename}: {error}") from error
+    return desired_from_files(files, "network configuration")
 
 
 def plan_network(desired: NetworkDesiredState) -> NetworkdConfiguration:
     """Resolve complete network intent and generate a validated candidate."""
-    return generate(
-        resolve_network(desired.interfaces, desired.gateways, desired.routes)
-    )
-
-
-def _desired_from_files(files: dict[str, bytes], source: str) -> NetworkDesiredState:
-    if any(filename not in files for filename in MANDATORY_DESIRED_FILENAMES):
-        raise ConfigurationError(
-            f"missing mandatory interfaces configuration in {source}"
-        )
-    return NetworkDesiredState(
-        interfaces=load_interfaces_contents(files["interfaces.yaml"].decode(), source),
-        gateways=(
-            load_gateways_contents(files["gateways.yaml"].decode(), source)
-            if "gateways.yaml" in files
-            else GatewaysConfig(version=1, gateways=[])
-        ),
-        routes=(
-            load_routes_contents(files["routes.yaml"].decode(), source)
-            if "routes.yaml" in files
-            else RoutesConfig(version=1, routes=[])
-        ),
-        files=files,
-    )
+    return generate(_resolve(desired))
 
 
 def _validate_desired_resource(resource: str, contents: bytes) -> None:
-    """Run schema/model validation that belongs to one desired-state document."""
+    """Validate one document; cross-resource rules run during planning."""
     source = f"edited {resource} configuration"
-    text = contents.decode("utf-8")
-    if resource == "interfaces":
-        load_interfaces_contents(text, source)
-    elif resource == "gateways":
-        load_gateways_contents(text, source)
-    elif resource == "routes":
-        load_routes_contents(text, source)
-    else:  # Keep this guard for callers that bypass _resource_filename.
+    if resource == "devices":
+        parse_document(contents, DevicesConfig, source)
+    elif resource == "interfaces":
+        parse_document(contents, LogicalInterfacesConfig, source)
+    elif resource == "routing":
+        parse_document(contents, RoutingConfig, source)
+    else:
         raise ValueError(f"unsupported network resource: {resource}")
 
 
@@ -414,11 +636,13 @@ def _write_desired_atomically(path: Path, contents: bytes) -> None:
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)
-    except BaseException:
+    except BaseException as error:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
+        except OSError as cleanup_error:
+            error.add_note(f"temporary-file cleanup failed: {cleanup_error}")
         raise
 
 
@@ -438,11 +662,11 @@ def _remove_desired(path: Path) -> None:
 def _resource_filename(resource: str) -> str:
     if resource not in EDITABLE_RESOURCES:
         raise ValueError(f"unsupported network resource: {resource}")
-    return f"{resource}.yaml"
+    return f"network/{resource}.yaml"
 
 
 def _filename_resource(filename: str) -> str:
-    return filename.removesuffix(".yaml")
+    return Path(filename).stem
 
 
 def _with_desired_header(resource: str, contents: bytes) -> bytes:
@@ -455,8 +679,6 @@ def _with_desired_header(resource: str, contents: bytes) -> bytes:
 
 
 def _empty_desired_resource(resource: str) -> bytes:
-    if resource == "gateways":
-        return b"version: 1\ngateways: []\n"
-    if resource == "routes":
-        return b"version: 1\nroutes: []\n"
-    raise ConfigurationError("interfaces.yaml is mandatory and cannot be initialized")
+    if resource == "routing":
+        return b"version: 2\ngateways: []\nroutes: []\n"
+    raise ConfigurationError(f"{resource}.yaml is mandatory and cannot be initialized")

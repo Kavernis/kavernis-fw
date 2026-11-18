@@ -1,174 +1,179 @@
-from copy import deepcopy
-from pathlib import Path
+"""Strict L3 addressing schemas, independent of device topology."""
 
 import pytest
 from kavernis.config.errors import ConfigurationError
-from kavernis.config.interfaces import InterfacesConfig, IPv4Mode, IPv6Mode
-from kavernis.config.loader import load_interfaces
+from kavernis.config.network import (
+    DevicesConfig,
+    LogicalInterfacesConfig,
+    RoutingConfig,
+    parse_document,
+)
+from network_helpers import interface
 from pydantic import ValidationError
 
 
-def valid_configuration() -> dict[str, object]:
-    return {
-        "version": 1,
-        "interfaces": [
-            {
-                "id": "lan",
-                "name": "LAN",
-                "device": "eth0",
-                "ipv4": {"mode": "static", "address": "192.168.10.1/24"},
-                "ipv6": {"mode": "slaac"},
-            }
-        ],
-    }
-
-
-def test_load_example_configuration() -> None:
-    config = load_interfaces(Path("configs/examples/interfaces.yaml"))
-
-    assert config.version == 1
-    assert [interface.id for interface in config.interfaces] == ["lan", "wan"]
-    assert str(config.interfaces[0].ipv4.address) == "192.168.0.1/24"
+def parse(**families):
+    return LogicalInterfacesConfig.model_validate(
+        {"version": 2, "interfaces": [interface(**families)]}
+    ).interfaces[0]
 
 
 @pytest.mark.parametrize(
-    ("mutation", "field"),
+    "model", [DevicesConfig, LogicalInterfacesConfig, RoutingConfig]
+)
+@pytest.mark.parametrize("version", [1, 3, True, "2", 2.0, None])
+def test_strict_version(model, version):
+    with pytest.raises(ValidationError, match="version"):
+        model.model_validate({"version": version})
+
+
+@pytest.mark.parametrize(
+    "families",
     [
-        (lambda data: data["interfaces"][0]["ipv4"].pop("address"), "ipv4"),
-        (
-            lambda data: data["interfaces"][0]["ipv4"].update(
-                {"mode": "dhcp", "address": "192.168.10.1/24"}
-            ),
-            "ipv4",
-        ),
-        (
-            lambda data: data["interfaces"][0]["ipv4"].update(
-                {"address": "2001:db8::1/64"}
-            ),
-            "ipv4",
-        ),
-        (lambda data: data["interfaces"][0].update({"unexpected": True}), "unexpected"),
+        {"ipv4": {"mode": "static"}},
+        {"ipv4": {"mode": "dhcp", "address": "192.0.2.1/24"}},
+        {"ipv4": {"mode": "disabled", "address": "192.0.2.1/24"}},
+        {"ipv4": {"mode": "static", "address": "2001:db8::1/64"}},
+        {"ipv6": {"mode": "static"}},
+        {"ipv6": {"mode": "static", "address": "192.0.2.1/24"}},
+        {"ipv6": {"mode": "slaac", "address": "2001:db8::1/64"}},
+        {"ipv6": {"mode": "dhcp6", "address": "2001:db8::1/64"}},
+        {"ipv6": {"mode": "disabled", "address": "2001:db8::1/64"}},
+        {"ipv4": {"mode": "dhcp6"}},
+        {"ipv6": {"mode": "dhcp"}},
+        {"ipv4": {"mode": "dhcp", "unknown": True}},
+        {"ipv6": None},
     ],
 )
-def test_reject_invalid_ip_configuration(mutation: object, field: str) -> None:
-    data = valid_configuration()
-    mutation(data)  # type: ignore[operator]
+def test_invalid_addressing(families):
+    with pytest.raises(ValidationError):
+        parse(**families)
 
+
+def test_missing_address_families_default_to_disabled():
+    config = parse()
+    assert config.ipv4.mode.value == config.ipv6.mode.value == "disabled"
+    assert LogicalInterfacesConfig(version=2, interfaces=()).interfaces == ()
+
+
+@pytest.mark.parametrize("field", ["vlan", "bridge", "uid", "routes", "unexpected"])
+def test_logical_interface_rejects_non_l3_fields(field):
     with pytest.raises(ValidationError, match=field):
-        InterfacesConfig.model_validate(data)
-
-
-def test_reject_duplicate_interface_id() -> None:
-    data = valid_configuration()
-    duplicate = deepcopy(data["interfaces"][0])
-    data["interfaces"].append(duplicate)
-
-    with pytest.raises(ValidationError, match="duplicate id"):
-        InterfacesConfig.model_validate(data)
-
-
-def test_reject_obsolete_uid_in_current_configuration() -> None:
-    data = valid_configuration()
-    data["interfaces"][0]["uid"] = "8f3a7c22-1c7d-4d6b-a901-000000000001"
-
-    with pytest.raises(ValidationError, match="uid"):
-        InterfacesConfig.model_validate(data)
-
-
-def test_reject_empty_interfaces_configuration() -> None:
-    with pytest.raises(ValidationError, match="at least one interface"):
-        InterfacesConfig.model_validate({"version": 1, "interfaces": []})
-
-
-def test_loader_exposes_context_for_invalid_yaml(tmp_path: Path) -> None:
-    path = tmp_path / "interfaces.yml"
-    path.write_text("interfaces: [", encoding="utf-8")
-
-    with pytest.raises(
-        ConfigurationError, match="cannot load interfaces configuration"
-    ):
-        load_interfaces(path)
-
-
-def test_missing_address_families_default_to_disabled() -> None:
-    config = InterfacesConfig.model_validate(
-        {
-            "version": 1,
-            "interfaces": [{"id": "trunk", "name": "Trunk", "device": "eth1"}],
-        }
-    )
-
-    assert config.interfaces[0].ipv4.mode is IPv4Mode.DISABLED
-    assert config.interfaces[0].ipv6.mode is IPv6Mode.DISABLED
-
-
-def test_dhcpv4_options_default_without_dhcp_subsection() -> None:
-    data = valid_configuration()
-    data["interfaces"][0]["ipv4"] = {"mode": "dhcp"}  # type: ignore[index]
-
-    dhcp = InterfacesConfig.model_validate(data).interfaces[0].ipv4.dhcp
-
-    assert dhcp.use_hostname is False
-    assert dhcp.send_hostname is True
-    assert dhcp.use_dns is True
-    assert dhcp.use_routes is True
-    assert dhcp.use_ntp is True
-    assert dhcp.route_metric is None
-
-
-def test_dhcpv4_options_allow_partial_and_complete_overrides() -> None:
-    data = valid_configuration()
-    data["interfaces"][0]["ipv4"] = {  # type: ignore[index]
-        "mode": "dhcp",
-        "dhcp": {
-            "use_hostname": True,
-            "send_hostname": False,
-            "use_dns": False,
-            "use_routes": False,
-            "use_ntp": False,
-            "route_metric": 200,
-        },
-    }
-
-    dhcp = InterfacesConfig.model_validate(data).interfaces[0].ipv4.dhcp
-
-    assert dhcp.use_hostname is True
-    assert dhcp.send_hostname is False
-    assert dhcp.use_dns is False
-    assert dhcp.use_routes is False
-    assert dhcp.use_ntp is False
-    assert dhcp.route_metric == 200
-
-    data["interfaces"][0]["ipv4"] = {  # type: ignore[index]
-        "mode": "dhcp",
-        "dhcp": {"use_dns": False},
-    }
-    partial = InterfacesConfig.model_validate(data).interfaces[0].ipv4.dhcp
-    assert partial.use_dns is False
-    assert partial.use_hostname is False
-    assert partial.send_hostname is True
-    assert partial.use_routes is True
-    assert partial.use_ntp is True
-    assert partial.route_metric is None
+        parse(**{field: {}})
 
 
 @pytest.mark.parametrize(
-    ("mode", "dhcp", "match"),
+    "field,value", [("id", "Invalid"), ("device", "eth0.1"), ("name", "  ")]
+)
+def test_interface_identifiers_and_display_name(field, value):
+    item = interface()
+    item[field] = value
+    with pytest.raises(ValidationError):
+        LogicalInterfacesConfig.model_validate({"version": 2, "interfaces": [item]})
+
+
+def test_dhcp_defaults_and_partial_override():
+    defaults = parse(ipv4={"mode": "dhcp"}).ipv4.dhcp
+    assert defaults.model_dump() == {
+        "use_hostname": False,
+        "send_hostname": True,
+        "use_dns": True,
+        "use_routes": True,
+        "use_ntp": True,
+        "route_metric": None,
+    }
+    partial = parse(ipv4={"mode": "dhcp", "dhcp": {"use_dns": False}}).ipv4.dhcp
+    assert partial == defaults.model_copy(update={"use_dns": False})
+
+
+@pytest.mark.parametrize("metric", [-1, 4294967296, True, "200", 2.5])
+def test_invalid_dhcp_metric(metric):
+    with pytest.raises(ValidationError, match="route_metric"):
+        parse(ipv4={"mode": "dhcp", "dhcp": {"route_metric": metric}})
+
+
+@pytest.mark.parametrize("mode", ["static", "disabled"])
+def test_dhcp_policy_requires_dhcp_mode(mode):
+    config = {"mode": mode, "dhcp": {"use_dns": False}}
+    if mode == "static":
+        config["address"] = "192.0.2.1/24"
+    with pytest.raises(ValidationError, match="dhcp"):
+        parse(ipv4=config)
+
+
+@pytest.mark.parametrize(
+    "field", ["use_hostname", "send_hostname", "use_dns", "use_routes", "use_ntp"]
+)
+def test_dhcp_booleans_are_strict(field):
+    with pytest.raises(ValidationError):
+        parse(ipv4={"mode": "dhcp", "dhcp": {field: "false"}})
+
+
+@pytest.mark.parametrize("contents", [b"interfaces: [", b"\xff", b"null", b"[]"])
+def test_parser_reports_source_on_invalid_document(contents):
+    with pytest.raises(ConfigurationError, match="edited interfaces"):
+        parse_document(contents, LogicalInterfacesConfig, "edited interfaces")
+
+
+@pytest.mark.parametrize(
+    "contents,duplicate_line",
     [
-        ("dhcp", {"route_metric": -1}, "route_metric"),
-        ("dhcp", {"route_metric": 4294967296}, "route_metric"),
-        ("static", {"use_dns": False}, "dhcp"),
-        ("disabled", {"use_dns": False}, "dhcp"),
+        (
+            b"version: 2\nversion: 2\ninterfaces: []\n",
+            2,
+        ),
+        (
+            b"version: 2\ninterfaces:\n- id: lan\n  name: LAN\n  device: nic\n"
+            b"  ipv4:\n    mode: disabled\n    mode: dhcp\n",
+            8,
+        ),
+        (
+            b"version: 2\ninterfaces:\n- id: lan\n  name: LAN\n  device: nic\n"
+            b"- id: wan\n  name: WAN\n  device: nic2\n  ipv6:\n"
+            b"    mode: slaac\n    mode: dhcp6\n",
+            10,
+        ),
     ],
 )
-def test_dhcpv4_options_reject_invalid_mode_or_metric(
-    mode: str, dhcp: dict[str, object], match: str
-) -> None:
-    data = valid_configuration()
-    ipv4: dict[str, object] = {"mode": mode, "dhcp": dhcp}
-    if mode == "static":
-        ipv4["address"] = "192.168.10.1/24"
-    data["interfaces"][0]["ipv4"] = ipv4  # type: ignore[index]
+def test_parser_rejects_duplicate_keys_with_source_and_line(contents, duplicate_line):
+    source = "network/interfaces.yaml"
+    with pytest.raises(ConfigurationError) as error:
+        parse_document(contents, LogicalInterfacesConfig, source)
+    message = str(error.value)
+    assert source in message
+    assert f"line {duplicate_line}" in message
 
-    with pytest.raises(ValidationError, match=match):
-        InterfacesConfig.model_validate(data)
+
+def test_parser_rejects_duplicate_routing_keys_in_sequence():
+    contents = (
+        b"version: 2\ngateways:\n- id: router\n  interface: lan\n"
+        b"  address: 192.0.2.1\nroutes:\n- id: route\n"
+        b"  network: 10.0.0.0/8\n  gateway: router\n  gateway: other\n"
+    )
+    with pytest.raises(ConfigurationError, match=r"(?s)routing.yaml.*line 10"):
+        parse_document(contents, RoutingConfig, "network/routing.yaml")
+
+
+def test_yaml_merge_defaults_allow_explicit_override():
+    contents = (
+        b"version: 2\ninterfaces:\n- id: lan\n  name: LAN\n  device: nic\n"
+        b"  ipv4: &ipv4_defaults\n    mode: dhcp\n    dhcp: {use_dns: true}\n"
+        b"- id: wan\n  name: WAN\n  device: nic2\n  ipv4:\n"
+        b"    <<: *ipv4_defaults\n    dhcp: {use_dns: false}\n"
+    )
+    parsed = parse_document(contents, LogicalInterfacesConfig, "interfaces.yaml")
+    assert parsed.interfaces[0].ipv4.dhcp is not None
+    assert parsed.interfaces[0].ipv4.dhcp.use_dns is True
+    assert parsed.interfaces[1].ipv4.dhcp is not None
+    assert parsed.interfaces[1].ipv4.dhcp.use_dns is False
+
+
+def test_yaml_merge_does_not_hide_duplicate_explicit_keys():
+    contents = (
+        b"version: 2\ninterfaces:\n- id: lan\n  name: LAN\n  device: nic\n"
+        b"  ipv4: &ipv4_defaults {mode: dhcp}\n- id: wan\n  name: WAN\n"
+        b"  device: nic2\n  ipv4:\n    <<: *ipv4_defaults\n"
+        b"    mode: slaac\n    mode: dhcp\n"
+    )
+    with pytest.raises(ConfigurationError, match=r"(?s)interfaces.yaml.*line 13"):
+        parse_document(contents, LogicalInterfacesConfig, "interfaces.yaml")

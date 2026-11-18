@@ -1,86 +1,72 @@
 from copy import deepcopy
 from dataclasses import replace
-from pathlib import Path
-from typing import Any
 
 import pytest
 from kavernis.backends.networkd import (
     NetworkdConfiguration,
     NetworkdValidationError,
-    generate,
     validate,
 )
-from kavernis.config.errors import ConfigurationError
-from kavernis.config.interfaces import InterfacesConfig
-from kavernis.config.loader import load_interfaces
-from kavernis.config.resolver import resolve_interfaces
-from kavernis.core.interfaces import plan_interfaces
-from kavernis.models.interface import BridgeSettings
+from kavernis.core.network import plan_network
+from kavernis.core.topology import resolve_topology
+from kavernis.models.device import BridgeSettings
+from network_helpers import desired, interface, physical
+from network_helpers import resolved_model as model
 from pydantic import ValidationError
 
 
-def configuration() -> dict[str, Any]:
-    interfaces = [
+def devices():
+    return [
+        physical("port-one", "eth1"),
+        physical("port-two", "eth2"),
         {
-            "id": identifier,
-            "name": identifier,
-            "device": device,
-            "ipv4": {"mode": "disabled"},
-            "ipv6": {"mode": "disabled"},
-        }
-        for identifier, device in [
-            ("lan-one", "eth1"),
-            ("lan-two", "eth2"),
-            ("lan", "br0"),
-        ]
-    ]
-    interfaces[2]["bridge"] = {"members": ["lan-one", "lan-two"]}
-    interfaces[2]["ipv4"] = {"mode": "static", "address": "192.168.10.1/24"}
-    interfaces[2]["ipv6"] = {"mode": "static", "address": "2001:db8::1/64"}
-    return {"version": 1, "interfaces": interfaces}
-
-
-def test_bridge_pipeline() -> None:
-    config = InterfacesConfig.model_validate(configuration())
-    models = resolve_interfaces(config)
-    assert models[0].bridge is None
-    assert models[2].bridge == BridgeSettings(members=("lan-one", "lan-two"))
-    candidate = plan_interfaces(config)
-    assert candidate.files == {
-        "10-kavernis-lan.netdev": (
-            "[NetDev]\nName=br0\nKind=bridge\n\n[Bridge]\nSTP=yes\n"
-        ),
-        "10-kavernis-lan.network": (
-            "[Match]\nName=br0\n\n[Network]\nAddress=192.168.10.1/24\n"
-            "Address=2001:db8::1/64\nIPv6AcceptRA=no\n"
-        ),
-        **{
-            f"10-kavernis-{identifier}.network": (
-                f"[Match]\nName={device}\n\n[Network]\nIPv6AcceptRA=no\n"
-                "DHCP=no\nLinkLocalAddressing=no\nBridge=br0\n"
-            )
-            for identifier, device in [("lan-one", "eth1"), ("lan-two", "eth2")]
+            "id": "lan-bridge",
+            "type": "bridge",
+            "name": "br0",
+            "bridge": {"members": ["port-one", "port-two"]},
         },
-    }
+    ]
 
 
-def test_bridge_member_with_omitted_address_families_is_unaddressed() -> None:
-    data = configuration()
-    data["interfaces"][0].pop("ipv4")
-    data["interfaces"][0].pop("ipv6")
-    config = InterfacesConfig.model_validate(data)
+def test_bridge_pipeline():
+    config = desired(
+        devices(),
+        [
+            interface(
+                "lan",
+                "lan-bridge",
+                ipv4={"mode": "static", "address": "192.168.10.1/24"},
+                ipv6={"mode": "static", "address": "2001:db8::1/64"},
+            )
+        ],
+    )
+    resolved = model(config)
+    assert resolved.devices[-1].settings == BridgeSettings(("port-one", "port-two"))
+    candidate = plan_network(config)
+    assert candidate.files["10-kavernis-lan-bridge.netdev"] == (
+        "[NetDev]\nName=br0\nKind=bridge\n\n[Bridge]\nSTP=yes\n"
+    )
+    assert (
+        "Address=192.168.10.1/24\nAddress=2001:db8::1/64\n"
+        in candidate.files["10-kavernis-lan-bridge.network"]
+    )
+    for identifier, name in [("port-one", "eth1"), ("port-two", "eth2")]:
+        assert candidate.files[f"10-kavernis-{identifier}.network"] == (
+            f"[Match]\nName={name}\n\n[Network]\nIPv6AcceptRA=no\n"
+            "DHCP=no\nLinkLocalAddressing=no\nBridge=br0\n"
+        )
 
-    assert config.interfaces[0].ipv4.mode.value == "disabled"
-    assert config.interfaces[0].ipv6.mode.value == "disabled"
 
-
-def test_bridge_generation_is_order_independent() -> None:
-    data = configuration()
-    first = plan_interfaces(InterfacesConfig.model_validate(data))
-    data["interfaces"][2]["bridge"]["members"].reverse()
-    data["interfaces"].reverse()
-    second = plan_interfaces(InterfacesConfig.model_validate(data))
-    assert list(first.files.items()) == list(second.files.items())
+def test_unassigned_bridge_and_order_independence():
+    data = devices()
+    first = plan_network(desired(data))
+    data[2]["bridge"]["members"].reverse()
+    data.reverse()
+    assert list(first.files.items()) == list(plan_network(desired(data)).files.items())
+    assert (
+        "DHCP=no\nLinkLocalAddressing=no\n"
+        in first.files["10-kavernis-lan-bridge.network"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -88,112 +74,120 @@ def test_bridge_generation_is_order_independent() -> None:
     [
         {},
         {"members": []},
-        {"members": ["lan-one", "lan-one"]},
-        {"members": "lan-one"},
+        {"members": ["port-one", "port-one"]},
+        {"members": "port-one"},
         {"members": [42]},
         {"members": ["bad id"]},
-        {"members": ["lan-one"], "unknown": True},
-        {"members": ["lan-one"], "stp": "false"},
+        {"members": ["port-one"], "unknown": True},
+        {"members": ["port-one"], "stp": "false"},
     ],
 )
-def test_reject_invalid_bridge_block(bridge: dict[str, Any]) -> None:
-    data = configuration()
-    data["interfaces"][2]["bridge"] = bridge
+def test_reject_invalid_bridge_block(bridge):
+    data = devices()
+    data[2]["bridge"] = bridge
     with pytest.raises(ValidationError, match="bridge"):
-        InterfacesConfig.model_validate(data)
+        desired(data)
 
 
-@pytest.mark.parametrize("member", ["missing", "eth1", "lan"])
-def test_reject_invalid_bridge_member(member: str) -> None:
-    data = configuration()
-    data["interfaces"][2]["bridge"]["members"] = [member]
-    with pytest.raises(ValidationError, match="bridge.members"):
-        InterfacesConfig.model_validate(data)
+@pytest.mark.parametrize("member", ["missing", "eth1", "lan-bridge"])
+def test_reject_invalid_bridge_member(member):
+    data = devices()
+    data[2]["bridge"]["members"] = [member]
+    with pytest.raises(ValueError, match="does not exist|cycle"):
+        plan_network(desired(data))
 
 
-def test_reject_shared_member_and_nested_bridge() -> None:
-    data = configuration()
-    second = deepcopy(data["interfaces"][2])
-    second.update(id="other", device="br1")
-    data["interfaces"].append(second)
-    with pytest.raises(ValidationError, match="already belongs"):
-        InterfacesConfig.model_validate(data)
-    second["bridge"]["members"] = ["lan"]
-    with pytest.raises(ValidationError, match="must not be a bridge"):
-        InterfacesConfig.model_validate(data)
+def test_reject_shared_member_and_nested_bridge():
+    data = devices()
+    second = deepcopy(data[2])
+    second.update(id="other", name="br1")
+    data.append(second)
+    with pytest.raises(ValueError, match="conflicting bridge ownership"):
+        plan_network(desired(data))
+    second["bridge"]["members"] = ["lan-bridge"]
+    with pytest.raises(ValueError, match="cannot be a bridge"):
+        plan_network(desired(data))
 
 
 @pytest.mark.parametrize(
-    ("family", "settings"),
+    "families",
     [
-        ("ipv4", {"mode": "dhcp"}),
-        ("ipv4", {"mode": "static", "address": "192.168.10.2/24"}),
-        ("ipv6", {"mode": "slaac"}),
-        ("ipv6", {"mode": "dhcp6"}),
-        ("ipv6", {"mode": "static", "address": "2001:db8::2/64"}),
+        {},
+        {"ipv4": {"mode": "dhcp"}},
+        {"ipv4": {"mode": "static", "address": "192.168.10.2/24"}},
+        {"ipv6": {"mode": "slaac"}},
+        {"ipv6": {"mode": "dhcp6"}},
+        {"ipv6": {"mode": "static", "address": "2001:db8::2/64"}},
     ],
 )
-def test_reject_ip_addressing_on_members(family: str, settings: dict[str, str]) -> None:
-    data = configuration()
-    data["interfaces"][0][family] = settings
-    with pytest.raises(ValidationError, match="configure IP addressing on the bridge"):
-        InterfacesConfig.model_validate(data)
+def test_bridge_member_cannot_have_l3_assignment_even_if_disabled(families):
+    with pytest.raises(ValueError, match="cannot have an L3 assignment"):
+        plan_network(desired(devices(), [interface(device="port-one", **families)]))
 
 
-@pytest.mark.parametrize("device", ["x" * 16, ".", "..", "br:0", "br0\nKind=vlan"])
-def test_reject_invalid_bridge_device(device: str) -> None:
-    data = configuration()
-    data["interfaces"][2]["device"] = device
-    with pytest.raises(ValidationError, match="device"):
-        InterfacesConfig.model_validate(data)
+@pytest.mark.parametrize("name", ["x" * 16, ".", "..", "br:0", "br0\nKind=vlan"])
+def test_reject_invalid_bridge_device(name):
+    data = devices()
+    data[2]["name"] = name
+    with pytest.raises(ValidationError, match="name"):
+        desired(data)
 
 
-def test_reject_bridge_and_vlan_on_same_interface() -> None:
-    data = configuration()
-    data["interfaces"][2]["vlan"] = {"parent": "lan-one", "tag": 20}
-    with pytest.raises(ValidationError, match="mutually exclusive"):
-        InterfacesConfig.model_validate(data)
+def test_reject_bridge_and_vlan_on_same_device():
+    data = devices()
+    data[2]["vlan"] = {"parent": "port-one", "tag": 20}
+    with pytest.raises(ValidationError):
+        desired(data)
 
 
-def test_bridge_supports_vlan_members() -> None:
-    data = configuration()
-    trunk = deepcopy(data["interfaces"][0])
-    trunk.update(id="trunk", device="eth3")
-    data["interfaces"].append(trunk)
-    data["interfaces"][0]["vlan"] = {"parent": "trunk", "tag": 20}
-    data["interfaces"][0]["device"] = "eth3.20"
-    candidate = plan_interfaces(InterfacesConfig.model_validate(data))
+def test_bridge_supports_vlan_members_and_rejects_bridged_vlan_parent():
+    data = devices()
+    data.append(physical("trunk", "eth3"))
+    data[0] = {
+        "id": "port-one",
+        "type": "vlan",
+        "name": "eth3.20",
+        "vlan": {"parent": "trunk", "tag": 20},
+    }
+    candidate = plan_network(desired(data))
     assert "VLAN=eth3.20\n" in candidate.files["10-kavernis-trunk.network"]
-    assert "Bridge=br0\n" in candidate.files["10-kavernis-lan-one.network"]
-    assert "Kind=vlan\n" in candidate.files["10-kavernis-lan-one.netdev"]
-    data["interfaces"][2]["bridge"]["members"].append("trunk")
-    with pytest.raises(ValidationError, match="is a VLAN parent"):
-        InterfacesConfig.model_validate(data)
-    data["interfaces"][2]["bridge"]["members"].remove("trunk")
-    data["interfaces"][0]["vlan"]["parent"] = "lan"
-    with pytest.raises(ValidationError, match="physical interface"):
-        InterfacesConfig.model_validate(data)
+    assert "Bridge=br0\n" in candidate.files["10-kavernis-port-one.network"]
+    assert "Kind=vlan\n" in candidate.files["10-kavernis-port-one.netdev"]
+    data[2]["bridge"]["members"].append("trunk")
+    with pytest.raises(ValueError, match="VLAN parent cannot be a bridge member"):
+        plan_network(desired(data))
+    data[2]["bridge"]["members"].remove("trunk")
+    data[2]["bridge"]["members"].remove("port-one")
+    data[0]["vlan"]["parent"] = "lan-bridge"
+    with pytest.raises(ValueError, match="parent must be physical"):
+        plan_network(desired(data))
 
 
-def test_bridge_supports_dhcp_and_explicit_stp_disable() -> None:
-    data = configuration()
-    bridge = data["interfaces"][2]
-    bridge["bridge"]["stp"] = False
-    bridge["ipv4"] = {"mode": "dhcp"}
-    bridge["ipv6"] = {"mode": "dhcp6"}
-    candidate = plan_interfaces(InterfacesConfig.model_validate(data))
-    assert "STP=no\n" in candidate.files["10-kavernis-lan.netdev"]
-    assert "DHCP=yes\n" in candidate.files["10-kavernis-lan.network"]
+def test_bridge_supports_dhcp_and_stp_disable():
+    data = devices()
+    data[2]["bridge"]["stp"] = False
+    candidate = plan_network(
+        desired(
+            data,
+            [
+                interface(
+                    device="lan-bridge", ipv4={"mode": "dhcp"}, ipv6={"mode": "dhcp6"}
+                )
+            ],
+        )
+    )
+    assert "STP=no\n" in candidate.files["10-kavernis-lan-bridge.netdev"]
+    assert "DHCP=yes\n" in candidate.files["10-kavernis-lan-bridge.network"]
 
 
 @pytest.mark.parametrize(
-    "members", [(), ("missing",), ("lan",), ("lan-one", "lan-one")]
+    "members", [(), ("missing",), ("lan-bridge",), ("port-one", "port-one")]
 )
-def test_backend_rejects_invalid_domain_bridge(members: tuple[str, ...]) -> None:
-    models = resolve_interfaces(InterfacesConfig.model_validate(configuration()))
-    models[2] = replace(models[2], bridge=BridgeSettings(members=members))
-    with pytest.raises(NetworkdValidationError, match="invalid bridge"):
-        generate(models)
+def test_core_rejects_invalid_domain_bridge(members):
+    resolved = model(desired(devices()))
+    bad = replace(resolved.devices[-1], settings=BridgeSettings(members))
+    with pytest.raises(ValueError):
+        resolve_topology(replace(resolved, devices=(*resolved.devices[:-1], bad)))
 
 
 @pytest.mark.parametrize(
@@ -205,23 +199,6 @@ def test_backend_rejects_invalid_domain_bridge(members: tuple[str, ...]) -> None
         "[NetDev]\nName=br0\nKind=bridge\n\n[Bridge]\nSTP=yes",
     ],
 )
-def test_reject_malformed_bridge_netdev(content: str) -> None:
+def test_reject_malformed_bridge_netdev(content):
     with pytest.raises(NetworkdValidationError, match="invalid bridge"):
-        validate(NetworkdConfiguration(files={"10-kavernis-lan.netdev": content}))
-
-
-def test_load_bridge_example() -> None:
-    config = load_interfaces(Path("configs/examples/interfaces-bridge.yaml"))
-    assert config.interfaces[2].bridge is not None
-    assert len(plan_interfaces(config).files) == 4
-
-
-def test_loader_reports_invalid_bridge(tmp_path: Path) -> None:
-    import yaml
-
-    data = configuration()
-    data["interfaces"][2]["bridge"]["members"] = ["missing"]
-    path = tmp_path / "interfaces.yml"
-    path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    with pytest.raises(ConfigurationError, match="lan: bridge.members 'missing'"):
-        load_interfaces(path)
+        validate(NetworkdConfiguration({"10-kavernis-lan-bridge.netdev": content}))

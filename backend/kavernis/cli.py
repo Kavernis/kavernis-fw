@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from kavernis.backends.network_runtime import RuntimeVerificationError
 from kavernis.backends.networkd import NetworkdApplyError, NetworkdConfiguration
 from kavernis.config.errors import ConfigurationError
 from kavernis.core.network import (
@@ -22,11 +23,12 @@ from kavernis.core.network import (
 )
 from kavernis.state.history import HistoryError
 from kavernis.state.lock import LockUnavailableError
+from kavernis.state.models import ApplyOutcomeKind
 from kavernis.state.sqlite import StateStoreError
 
-INTERFACES_PATH = "/etc/kavernis/interfaces.yaml"
-GATEWAYS_PATH = "/etc/kavernis/gateways.yaml"
-ROUTES_PATH = "/etc/kavernis/routes.yaml"
+DEVICES_PATH = "/etc/kavernis/network/devices.yaml"
+INTERFACES_PATH = "/etc/kavernis/network/interfaces.yaml"
+ROUTING_PATH = "/etc/kavernis/network/routing.yaml"
 HISTORY_PATH = "/var/lib/kavernis/history"
 STATE_DATABASE_PATH = "/var/lib/kavernis/state.db"
 NETWORKD_PATH = "/etc/systemd/network"
@@ -48,9 +50,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     edit_command = action.add_parser(
         "edit", help="safely edit one network desired-state resource"
     )
-    edit_command.add_argument(
-        "resource", choices=("interfaces", "gateways", "routes")
-    )
+    edit_command.add_argument("resource", choices=("devices", "interfaces", "routing"))
     diff_command = action.add_parser("diff", help="show desired-state differences")
     diff_command.add_argument("resource", choices=("network",))
     diff_command.add_argument("revision", nargs="?")
@@ -76,6 +76,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "Rolled back and applied "
                 f"{len(candidate.files)} systemd-networkd file(s)."
             )
+            print(
+                "Configuration activation and static runtime verified; "
+                "dynamic acquisition and connectivity are not verified."
+            )
         elif parsed.action == "edit":
             changed = service.edit_resource(
                 parsed.resource, _invoke_editor, _retry_invalid_edit
@@ -84,6 +88,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         elif parsed.action == "apply":
             candidate = service.apply()
             print(f"Applied {len(candidate.files)} systemd-networkd file(s).")
+            print(
+                "Configuration activation and static runtime verified; "
+                "dynamic acquisition and connectivity are not verified."
+            )
         else:
             desired = load_network(service.paths)
             if parsed.action == "plan":
@@ -106,6 +114,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         HistoryError,
         NetworkdApplyError,
         StateStoreError,
+        RuntimeVerificationError,
         LockUnavailableError,
         DesiredStateChangedError,
         EditorFailedError,
@@ -113,10 +122,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
         OSError,
     ) as error:
         print(f"Error: {error}", file=sys.stderr)
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
-        print("Aborted; desired state was unchanged.", file=sys.stderr)
+    except KeyboardInterrupt as error:
+        print("Interrupted.", file=sys.stderr)
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
         return 1
+    except SystemExit as error:
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
+        raise
     return 0
 
 
@@ -168,8 +185,8 @@ def _state_service() -> NetworkStateService:
     return NetworkStateService(
         NetworkStatePaths(
             interfaces_path=Path(INTERFACES_PATH),
-            gateways_path=Path(GATEWAYS_PATH),
-            routes_path=Path(ROUTES_PATH),
+            devices_path=Path(DEVICES_PATH),
+            routing_path=Path(ROUTING_PATH),
             history_path=Path(HISTORY_PATH),
             database_path=Path(STATE_DATABASE_PATH),
             networkd_path=Path(NETWORKD_PATH),
@@ -180,9 +197,21 @@ def _state_service() -> NetworkStateService:
 
 def _print_status(status: NetworkStatus) -> None:
     """Print Kavernis concepts rather than state-store implementation details."""
-    print(f"Status: {status.kind.value}")
+    print(f"Network configuration: {status.kind.value}")
     print(f"Desired revision: {status.desired_revision or 'unrecorded desired state'}")
-    print(f"Applied revision: {status.applied_revision or 'none'}")
+    print(f"Last successful revision: {status.applied_revision or 'none'}")
+    if status.last_outcome is not None:
+        outcome = status.last_outcome
+        outcome_text = (
+            "failed" if outcome.kind is ApplyOutcomeKind.FAILURE else "success"
+        )
+        print(f"Last apply: {outcome_text}")
+        print(f"Operation: {outcome.operation.value}")
+        print(f"Last operation at: {outcome.recorded_at.isoformat()}")
+        if outcome.revision is not None:
+            print(f"Last operation revision: {outcome.revision}")
+        if outcome.kind is ApplyOutcomeKind.FAILURE and outcome.message is not None:
+            print(f"Failure: {outcome.message}")
     for item in status.drift:
         print(f"Drift: {item.kind.value} {item.filename}")
 

@@ -33,6 +33,8 @@ include = [
   "/backend/kavernis/templates/**/*.j2",
   "/backend",
   "/configs",
+  "/docs",
+  "/scripts",
   "/schemas",
   "/tests",
   "/README.md",

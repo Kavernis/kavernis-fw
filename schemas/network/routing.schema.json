@@ -1,0 +1,174 @@
+{
+  "$defs": {
+    "GatewayConfig": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "onlink": {
+                "const": true
+              }
+            },
+            "required": [
+              "onlink"
+            ]
+          },
+          "then": {
+            "properties": {
+              "address": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "address"
+            ]
+          }
+        }
+      ],
+      "description": "A next-hop or direct interface exit, before cross-resource resolution.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "interface": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Interface",
+          "type": "string"
+        },
+        "address": {
+          "anyOf": [
+            {
+              "format": "ipv4",
+              "type": "string"
+            },
+            {
+              "format": "ipv6",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Address"
+        },
+        "onlink": {
+          "default": false,
+          "title": "Onlink",
+          "type": "boolean"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        }
+      },
+      "required": [
+        "id",
+        "interface"
+      ],
+      "title": "GatewayConfig",
+      "type": "object"
+    },
+    "RouteConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "network": {
+          "anyOf": [
+            {
+              "format": "ipv4network",
+              "type": "string"
+            },
+            {
+              "format": "ipv6network",
+              "type": "string"
+            }
+          ],
+          "title": "Network"
+        },
+        "gateway": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Gateway",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        }
+      },
+      "required": [
+        "id",
+        "network",
+        "gateway"
+      ],
+      "title": "RouteConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 2,
+      "title": "Version",
+      "type": "integer"
+    },
+    "gateways": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/GatewayConfig"
+      },
+      "title": "Gateways",
+      "type": "array"
+    },
+    "routes": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/RouteConfig"
+      },
+      "title": "Routes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "version"
+  ],
+  "title": "RoutingConfig",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

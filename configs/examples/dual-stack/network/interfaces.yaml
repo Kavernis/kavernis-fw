@@ -1,0 +1,18 @@
+version: 2
+
+interfaces:
+  - id: wan
+    name: WAN
+    device: wan-nic
+    ipv4:
+      mode: dhcp
+    ipv6:
+      mode: dhcp6
+  - id: lan
+    name: LAN
+    device: lan-nic
+    ipv4:
+      mode: static
+      address: 192.168.10.1/24
+    ipv6:
+      mode: slaac

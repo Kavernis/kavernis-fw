@@ -1,23 +1,34 @@
-"""Deterministic systemd-networkd configuration generation for interfaces."""
+"""Deterministic systemd-networkd configuration generation for network devices."""
 
 import hashlib
 import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from ipaddress import ip_address, ip_interface, ip_network
+from math import isfinite
 from pathlib import Path
 
+from kavernis.backends.network_runtime import effective_onlink
+from kavernis.models.device import BridgeSettings, VLANSettings
 from kavernis.models.interface import (
+    InterfaceAddressing,
     IPv4AddressMode,
     IPv6AddressMode,
-    NetworkInterface,
 )
+from kavernis.models.network import NetworkModel
 from kavernis.rendering import render_template
-from kavernis.state.models import ArtifactDrift, ArtifactDriftKind
+from kavernis.state.models import (
+    ApplyCommit,
+    ArtifactDrift,
+    ArtifactDriftKind,
+    CommitPhase,
+)
 
 NETWORKD_FILE_MODE = 0o644
+MANAGED_FILENAME = re.compile(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)")
 
 
 class NetworkdValidationError(ValueError):
@@ -87,55 +98,64 @@ class BridgeNetdevTemplateContext:
     stp: str
 
 
-def generate(interfaces: Sequence[NetworkInterface]) -> NetworkdConfiguration:
-    """Generate deterministic .network and virtual interface .netdev files."""
-    ordered = sorted(interfaces, key=lambda item: item.id)
-    children: dict[str, list[str]] = {interface.id: [] for interface in ordered}
-    by_id = {interface.id: interface for interface in ordered}
-    pairs: set[tuple[str, int]] = set()
-    for interface in ordered:
-        if interface.vlan is None:
-            continue
-        vlan = interface.vlan
-        parent = by_id.get(vlan.parent)
-        if (
-            parent is None
-            or parent.id == interface.id
-            or parent.vlan is not None
-            or parent.bridge is not None
-        ):
-            raise NetworkdValidationError(
-                f"interface {interface.id}: invalid VLAN parent {vlan.parent}"
-            )
-        pair = (vlan.parent, vlan.tag)
-        if pair in pairs:
-            raise NetworkdValidationError(f"interface {interface.id}: duplicate VLAN")
-        pairs.add(pair)
-        children[vlan.parent].append(interface.device)
+def generate(model: NetworkModel) -> NetworkdConfiguration:
+    """Render a resolved network model, with one native configuration per device."""
+    interfaces = {interface.device: interface for interface in model.interfaces}
+    children: dict[str, list[str]] = {device.id: [] for device in model.devices}
+    bridges: dict[str, str] = {}
+    for device in model.devices:
+        if isinstance(device.settings, VLANSettings):
+            children[device.settings.parent].append(device.name)
+        elif isinstance(device.settings, BridgeSettings):
+            for member in device.settings.members:
+                bridges[member] = device.name
 
-    bridges = _bridge_attachments(ordered)
-    files: dict[str, str] = {}
-    for interface in ordered:
-        stem = f"10-kavernis-{interface.id}"
-        files[f"{stem}.network"] = _render_interface(
-            interface, children[interface.id], bridges.get(interface.id)
+    gateways = {gateway.id: gateway for gateway in model.routing.gateways}
+    routes: dict[str, list[RouteTemplateContext]] = {
+        interface.id: [] for interface in model.interfaces
+    }
+    for route in sorted(model.routing.routes, key=lambda item: item.id):
+        gateway = gateways[route.gateway]
+        routes[gateway.interface].append(
+            RouteTemplateContext(
+                destination=str(route.network),
+                gateway=str(gateway.address) if gateway.address is not None else None,
+                gateway_onlink=(
+                    "yes"
+                    if effective_onlink(
+                        next(i for i in model.interfaces if i.id == gateway.interface),
+                        gateway,
+                    )
+                    else None
+                ),
+            )
         )
-        if interface.vlan is not None:
-            vlan_context = VlanNetdevTemplateContext(
-                device=interface.device, tag=interface.vlan.tag
-            )
+
+    files: dict[str, str] = {}
+    for device in sorted(model.devices, key=lambda item: item.id):
+        interface = interfaces.get(device.id)
+        stem = f"10-kavernis-{device.id}"
+        files[f"{stem}.network"] = _render_network(
+            device.name,
+            interface.addressing if interface else InterfaceAddressing(),
+            sorted(children[device.id]),
+            bridges.get(device.id),
+            tuple(routes[interface.id]) if interface else (),
+        )
+        if isinstance(device.settings, VLANSettings):
             files[f"{stem}.netdev"] = render_template(
-                "interfaces/vlan.netdev.j2",
-                asdict(vlan_context),
+                "network/vlan.netdev.j2",
+                asdict(VlanNetdevTemplateContext(device.name, device.settings.tag)),
             )
-        elif interface.bridge is not None:
-            bridge_context = BridgeNetdevTemplateContext(
-                device=interface.device,
-                stp="yes" if interface.bridge.stp else "no",
-            )
+        elif isinstance(device.settings, BridgeSettings):
             files[f"{stem}.netdev"] = render_template(
-                "interfaces/bridge.netdev.j2",
-                asdict(bridge_context),
+                "network/bridge.netdev.j2",
+                asdict(
+                    BridgeNetdevTemplateContext(
+                        device.name,
+                        "yes" if device.settings.stp else "no",
+                    )
+                ),
             )
     candidate = NetworkdConfiguration(files=files)
     validate(candidate)
@@ -156,7 +176,7 @@ def validate(candidate: NetworkdConfiguration) -> None:
         )
 
     for filename, content in candidate.files.items():
-        if not re.fullmatch(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", filename):
+        if not MANAGED_FILENAME.fullmatch(filename):
             raise NetworkdValidationError(f"unsafe networkd filename: {filename}")
         if "/" in filename or "\\" in filename:
             raise NetworkdValidationError(f"unsafe networkd filename: {filename}")
@@ -165,8 +185,8 @@ def validate(candidate: NetworkdConfiguration) -> None:
                 _validate_bridge_netdev(filename, content)
             else:
                 _validate_vlan_netdev(filename, content)
-        elif not content.startswith("[Match]\n") or "\n[Network]\n" not in content:
-            raise NetworkdValidationError(f"invalid networkd content for {filename}")
+        else:
+            _validate_network(filename, content)
         if not content.endswith("\n"):
             raise NetworkdValidationError(
                 f"networkd content must end with newline: {filename}"
@@ -176,38 +196,111 @@ def validate(candidate: NetworkdConfiguration) -> None:
 def apply(
     candidate: NetworkdConfiguration,
     directory: Path = Path("/etc/systemd/network"),
+    *,
+    verify: Callable[[], None] | None = None,
+    verify_recovery: Callable[[], None] | None = None,
+    record: Callable[[], None] | None = None,
+    commit: ApplyCommit | None = None,
+    reload_timeout: float = 15.0,
 ) -> None:
-    """Install a validated candidate and ask systemd-networkd to reload it.
+    """Install/reload within a narrow recovery boundary, then verify and record.
 
-    Only Kavernis-owned files are replaced or removed. If networkctl cannot
-    activate the candidate, the previously managed files are restored before
-    the error is reported.
+    Without callbacks this is an artifact activation primitive, not evidence of
+    runtime convergence. Core supplies verification and durable-record callbacks.
     """
     validate(candidate)
-    previous = _managed_files(directory)
+    if not isfinite(reload_timeout) or reload_timeout <= 0:
+        raise ValueError("reload timeout must be positive")
+    try:
+        previous = _managed_files_bytes(directory)
+    except OSError as error:
+        raise NetworkdApplyError(f"cannot read managed artifacts: {error}") from error
+    except BaseException as error:
+        error.add_note("apply interrupted before native mutation; recovery not needed")
+        raise
+    phase = "artifact mutation"
     try:
         directory.mkdir(parents=True, exist_ok=True)
         for filename, content in candidate.files.items():
             _write_atomically(directory / filename, content)
-        for filename in set(previous) - set(candidate.files):
+        for filename in sorted(set(previous) - set(candidate.files)):
             (directory / filename).unlink()
+        _sync_directory(directory)
+        phase = "native reload"
         subprocess.run(
-            ["networkctl", "reload"], check=True, capture_output=True, text=True
+            ["networkctl", "reload"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=reload_timeout,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
-        _restore(directory, previous)
-        try:
-            subprocess.run(
-                ["networkctl", "reload"], check=False, capture_output=True, text=True
+        phase = "runtime verification"
+        if verify is not None:
+            verify()
+        phase = "applied-state recording"
+        if record is not None:
+            record()
+    except BaseException as error:
+        # Deliberately narrow: after persistent mutation starts, even cancellation
+        # owes best-effort restoration. Never replace the original cancellation.
+        if commit is not None and commit.phase is CommitPhase.COMMITTED:
+            error.add_note(
+                "interrupted after verified success was durably recorded; "
+                "native configuration and successful outcome retained"
             )
-        except OSError:
-            pass
-        detail = str(error)
+            raise
+        if commit is not None and commit.phase is CommitPhase.COMMIT_ATTEMPTED:
+            error.add_note(
+                "durable recording outcome is uncertain after commit was attempted; "
+                "native recovery not attempted; inspect SQLite and Linux"
+            )
+            raise
+        recovery = _recover(directory, previous, verify_recovery, reload_timeout)
+        detail = f"apply failed during {phase}: {error}; {recovery}"
         if isinstance(error, subprocess.CalledProcessError):
-            detail = str(error.stderr).strip()
-        raise NetworkdApplyError(
-            f"cannot apply networkd configuration: {detail}"
-        ) from error
+            detail += f"; {error.stderr}"
+        if isinstance(error, (OSError, subprocess.SubprocessError)):
+            raise NetworkdApplyError(detail) from error
+        error.add_note(detail)
+        raise
+
+
+def _recover(
+    directory: Path,
+    previous: Mapping[str, bytes],
+    verify: Callable[[], None] | None,
+    timeout: float,
+) -> str:
+    """Best effort cleanup, reporting each boundary without losing the cause."""
+    try:
+        _restore(directory, previous)
+    except BaseException as error:
+        return f"artifact recovery failed: {type(error).__name__}: {error}"
+    try:
+        recovery = subprocess.run(
+            ["networkctl", "reload"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if recovery.returncode:
+            return (
+                "previous files restored but recovery reload failed: "
+                f"{recovery.stderr.strip() or recovery.returncode}"
+            )
+    except BaseException as error:
+        return f"previous files restored but recovery reload failed: {error}"
+    if verify is None:
+        return "previous files restored and reloaded; runtime restoration unverified"
+    try:
+        verify()
+    except BaseException as error:
+        return (
+            "previous files restored and reloaded; runtime recovery failed: "
+            f"{type(error).__name__}: {error}"
+        )
+    return "previous files restored; required static runtime restoration verified"
 
 
 def artifact_hashes(candidate: NetworkdConfiguration) -> dict[str, str]:
@@ -244,31 +337,20 @@ def inspect_artifact_drift(
     return tuple(drift)
 
 
-def _managed_files(directory: Path) -> dict[str, str]:
-    """Return only existing files owned by Kavernis."""
-    if not directory.exists():
-        return {}
-    return {
-        path.name: path.read_text(encoding="utf-8")
-        for path in directory.iterdir()
-        if path.is_file()
-        and re.fullmatch(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name)
-    }
-
-
 def _managed_files_bytes(directory: Path) -> dict[str, bytes]:
-    """Read managed artifacts as bytes for exact hash comparison."""
+    """Read only regular owned artifacts, preserving exact bytes for recovery."""
     if not directory.exists():
         return {}
-    return {
-        path.name: path.read_bytes()
-        for path in directory.iterdir()
-        if path.is_file()
-        and re.fullmatch(r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name)
-    }
+    result: dict[str, bytes] = {}
+    for path in directory.iterdir():
+        if MANAGED_FILENAME.fullmatch(path.name):
+            if path.is_symlink() or not path.is_file():
+                raise OSError(f"managed artifact is not a regular file: {path}")
+            result[path.name] = path.read_bytes()
+    return result
 
 
-def _write_atomically(path: Path, content: str) -> None:
+def _write_atomically(path: Path, content: str | bytes) -> None:
     """Replace one native configuration file without exposing partial content.
 
     Native networkd artifacts must be world-readable irrespective of the
@@ -276,31 +358,76 @@ def _write_atomically(path: Path, content: str) -> None:
     """
     descriptor, temporary_name = tempfile.mkstemp(prefix=".kavernis-", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
-            temporary.write(content)
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(
+                content.encode("utf-8") if isinstance(content, str) else content
+            )
             temporary.flush()
             os.fsync(temporary.fileno())
         os.chmod(temporary_name, NETWORKD_FILE_MODE)
         os.replace(temporary_name, path)
-    except BaseException:
+    except BaseException as error:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
+        except OSError as cleanup_error:
+            error.add_note(f"temporary-file cleanup failed: {cleanup_error}")
         raise
 
 
-def _restore(directory: Path, previous: Mapping[str, str]) -> None:
-    """Restore the managed-file snapshot after an unsuccessful activation."""
+def _sync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _restore(directory: Path, previous: Mapping[str, bytes]) -> None:
+    """Atomically restore prior files, then remove newly introduced artifacts."""
     if not directory.exists():
         return
-    for path in directory.iterdir():
-        if path.is_file() and re.fullmatch(
-            r"10-kavernis-[a-z][a-z0-9-]*\.(network|netdev)", path.name
-        ):
-            path.unlink()
     for filename, content in previous.items():
         _write_atomically(directory / filename, content)
+    for filename in sorted(set(_managed_files_bytes(directory)) - set(previous)):
+        (directory / filename).unlink()
+    _sync_directory(directory)
+
+
+def _validate_network(filename: str, content: str) -> None:
+    """Accept only the constrained syntax emitted by the packaged template."""
+    pattern = (
+        r"\[Match\]\nName=[A-Za-z0-9_.:-]+\n\n\[Network\]\n"
+        r"(?:Address=[A-Za-z0-9_.:%/-]+\n)*"
+        r"(?:IPv6AcceptRA=(?:yes|no)\n)?"
+        r"(?:DHCP=(?:yes|no|ipv4|ipv6)\n)?"
+        r"(?:LinkLocalAddressing=(?:no|ipv6)\n)?"
+        r"(?:VLAN=[A-Za-z0-9_.-]{1,15}\n)*"
+        r"(?:Bridge=[A-Za-z0-9_.-]{1,15}\n)?"
+        r"(?:\n\[DHCPv4\]\nUseHostname=(?:yes|no)\n"
+        r"SendHostname=(?:yes|no)\nUseDNS=(?:yes|no)\n"
+        r"UseRoutes=(?:yes|no)\nUseNTP=(?:yes|no)\n(?:RouteMetric=[0-9]+\n)?)?"
+        r"(?:\n\[Route\]\nDestination=[A-Za-z0-9_.:%/-]+\n"
+        r"(?:Gateway=[A-Za-z0-9_.:%-]+\n)?(?:GatewayOnLink=yes\n)?)*"
+    )
+    if re.fullmatch(pattern, content) is None:
+        raise NetworkdValidationError(f"invalid networkd content for {filename}")
+    try:
+        for line in content.splitlines():
+            key, _, value = line.partition("=")
+            if key == "Address":
+                ip_interface(value)
+            elif key == "Destination":
+                ip_network(value)
+            elif key == "Gateway":
+                ip_address(value)
+            elif key == "RouteMetric" and not 0 <= int(value) <= 4294967295:
+                raise ValueError("invalid DHCP route metric")
+    except ValueError as error:
+        raise NetworkdValidationError(
+            f"invalid networkd content for {filename}: {error}"
+        ) from error
 
 
 def _validate_vlan_netdev(filename: str, content: str) -> None:
@@ -313,35 +440,6 @@ def _validate_vlan_netdev(filename: str, content: str) -> None:
         raise NetworkdValidationError(f"invalid VLAN netdev content for {filename}")
 
 
-def _bridge_attachments(interfaces: Sequence[NetworkInterface]) -> dict[str, str]:
-    """Resolve validated member ids to native bridge device names."""
-    by_id = {interface.id: interface for interface in interfaces}
-    vlan_parents = {
-        interface.vlan.parent for interface in interfaces if interface.vlan is not None
-    }
-    attachments: dict[str, str] = {}
-    for interface in interfaces:
-        if interface.bridge is None:
-            continue
-        if interface.vlan is not None or not interface.bridge.members:
-            raise NetworkdValidationError(f"interface {interface.id}: invalid bridge")
-        for member_id in interface.bridge.members:
-            member = by_id.get(member_id)
-            if (
-                member is None
-                or member.bridge is not None
-                or member_id in attachments
-                or member_id in vlan_parents
-                or member.ipv4.mode is not IPv4AddressMode.DISABLED
-                or member.ipv6.mode is not IPv6AddressMode.DISABLED
-            ):
-                raise NetworkdValidationError(
-                    f"interface {interface.id}: invalid bridge member {member_id}"
-                )
-            attachments[member_id] = interface.device
-    return attachments
-
-
 def _validate_bridge_netdev(filename: str, content: str) -> None:
     match = re.fullmatch(
         r"\[NetDev\]\nName=([A-Za-z0-9_.-]{1,15})\nKind=bridge\n\n"
@@ -352,67 +450,68 @@ def _validate_bridge_netdev(filename: str, content: str) -> None:
         raise NetworkdValidationError(f"invalid bridge netdev content for {filename}")
 
 
-def _render_interface(
-    interface: NetworkInterface,
+def _render_network(
+    device_name: str,
+    addressing: InterfaceAddressing,
     vlans: Sequence[str] = (),
     bridge: str | None = None,
+    routes: tuple[RouteTemplateContext, ...] = (),
 ) -> str:
     """Resolve network intent into the limited context used by the template."""
     addresses: list[str] = []
     ipv6_accept_ra: str | None = None
 
-    if interface.ipv4.mode is IPv4AddressMode.STATIC:
-        if interface.ipv4.address is None:
+    if addressing.ipv4.mode is IPv4AddressMode.STATIC:
+        if addressing.ipv4.address is None:
             raise NetworkdValidationError(
-                f"static IPv4 interface {interface.id} has no address"
+                f"static IPv4 interface {device_name} has no address"
             )
-        addresses.append(str(interface.ipv4.address))
+        addresses.append(str(addressing.ipv4.address))
 
-    if interface.ipv6.mode is IPv6AddressMode.STATIC:
-        if interface.ipv6.address is None:
+    if addressing.ipv6.mode is IPv6AddressMode.STATIC:
+        if addressing.ipv6.address is None:
             raise NetworkdValidationError(
-                f"static IPv6 interface {interface.id} has no address"
+                f"static IPv6 interface {device_name} has no address"
             )
-        addresses.append(str(interface.ipv6.address))
+        addresses.append(str(addressing.ipv6.address))
         ipv6_accept_ra = "no"
-    elif interface.ipv6.mode is IPv6AddressMode.SLAAC:
+    elif addressing.ipv6.mode is IPv6AddressMode.SLAAC:
         ipv6_accept_ra = "yes"
-    elif interface.ipv6.mode is IPv6AddressMode.DISABLED:
+    elif addressing.ipv6.mode is IPv6AddressMode.DISABLED:
         ipv6_accept_ra = "no"
 
-    dhcp: str | None = None
+    dhcp: str | None = "no"
     dhcp_v4: DHCPv4TemplateContext | None = None
     if (
-        interface.ipv4.mode is IPv4AddressMode.DHCP
-        and interface.ipv6.mode is IPv6AddressMode.DHCP6
+        addressing.ipv4.mode is IPv4AddressMode.DHCP
+        and addressing.ipv6.mode is IPv6AddressMode.DHCP6
     ):
         dhcp = "yes"
-    elif interface.ipv4.mode is IPv4AddressMode.DHCP:
+    elif addressing.ipv4.mode is IPv4AddressMode.DHCP:
         dhcp = "ipv4"
-    elif interface.ipv6.mode is IPv6AddressMode.DHCP6:
+    elif addressing.ipv6.mode is IPv6AddressMode.DHCP6:
         dhcp = "ipv6"
 
-    if interface.ipv4.mode is IPv4AddressMode.DHCP:
-        if interface.ipv4.dhcp is None:
+    if addressing.ipv4.mode is IPv4AddressMode.DHCP:
+        if addressing.ipv4.dhcp is None:
             raise NetworkdValidationError(
-                f"DHCP IPv4 interface {interface.id} has no DHCPv4 policy"
+                f"DHCP IPv4 interface {device_name} has no DHCPv4 policy"
             )
         dhcp_v4 = DHCPv4TemplateContext(
-            use_hostname="yes" if interface.ipv4.dhcp.use_hostname else "no",
-            send_hostname="yes" if interface.ipv4.dhcp.send_hostname else "no",
-            use_dns="yes" if interface.ipv4.dhcp.use_dns else "no",
-            use_routes="yes" if interface.ipv4.dhcp.use_routes else "no",
-            use_ntp="yes" if interface.ipv4.dhcp.use_ntp else "no",
-            route_metric=interface.ipv4.dhcp.route_metric,
+            use_hostname="yes" if addressing.ipv4.dhcp.use_hostname else "no",
+            send_hostname="yes" if addressing.ipv4.dhcp.send_hostname else "no",
+            use_dns="yes" if addressing.ipv4.dhcp.use_dns else "no",
+            use_routes="yes" if addressing.ipv4.dhcp.use_routes else "no",
+            use_ntp="yes" if addressing.ipv4.dhcp.use_ntp else "no",
+            route_metric=addressing.ipv4.dhcp.route_metric,
         )
 
-    link_local_addressing: str | None = None
-    if bridge is not None:
-        dhcp = "no"
-        link_local_addressing = "no"
+    link_local_addressing = (
+        "no" if addressing.ipv6.mode is IPv6AddressMode.DISABLED else "ipv6"
+    )
 
     context = NetworkTemplateContext(
-        device=interface.device,
+        device=device_name,
         addresses=tuple(addresses),
         dhcp=dhcp,
         dhcp_v4=dhcp_v4,
@@ -420,13 +519,6 @@ def _render_interface(
         link_local_addressing=link_local_addressing,
         vlans=tuple(vlans),
         bridge=bridge,
-        routes=tuple(
-            RouteTemplateContext(
-                destination=str(route.network),
-                gateway=str(route.gateway_address) if route.gateway_address else None,
-                gateway_onlink="yes" if route.gateway_onlink else None,
-            )
-            for route in interface.routes
-        ),
+        routes=routes,
     )
-    return render_template("interfaces/network.j2", asdict(context))
+    return render_template("network/network.j2", asdict(context))

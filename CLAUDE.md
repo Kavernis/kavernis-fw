@@ -153,9 +153,9 @@ Public Kavernis configuration is declarative YAML.
 Configuration SHOULD remain separated by domain, for example:
 
 ```text id="0d44kp"
-interfaces.yaml
-gateways.yaml
-routes.yaml
+network/devices.yaml
+network/interfaces.yaml
+network/routing.yaml
 firewall.yaml
 dhcp.yaml
 dns.yaml
@@ -176,14 +176,15 @@ Configuration objects use `domain + id` as their immutable logical identity.
 
 * `id` — immutable human-readable identifier used for configuration references
 
-`name` is a mutable display attribute.
+`name` is a mutable display attribute for logical interfaces. Device `name`
+is the Linux kernel name; device `id` remains the stable reference identity.
 
 Example:
 
 ```yaml id="aj2b5c"
 - id: lan
   name: Users LAN
-  device: eth1
+  device: lan-nic
 ```
 
 References between configuration objects SHOULD use `id`.

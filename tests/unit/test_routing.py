@@ -1,160 +1,292 @@
-from copy import deepcopy
+from dataclasses import replace
 
 import pytest
-from kavernis.config.gateways import GatewaysConfig
-from kavernis.config.interfaces import InterfacesConfig
-from kavernis.config.resolver import resolve_network
-from kavernis.config.routes import RoutesConfig
-from kavernis.core.network import NetworkDesiredState, plan_network
+from kavernis.core.network import plan_network
+from network_helpers import desired, interface, physical
 from pydantic import ValidationError
 
 
-def interfaces() -> InterfacesConfig:
-    return InterfacesConfig.model_validate(
-        {
-            "version": 1,
-            "interfaces": [
-                {
-                    "id": "wan",
-                    "name": "WAN",
-                    "device": "eth0",
-                    "ipv4": {"mode": "static", "address": "192.168.0.1/24"},
-                    "ipv6": {"mode": "disabled"},
-                },
-                {
-                    "id": "servers",
-                    "name": "Servers",
-                    "device": "eth1",
-                    "ipv4": {"mode": "static", "address": "192.168.40.254/24"},
-                    "ipv6": {"mode": "static", "address": "2001:db8:40::1/64"},
-                },
-                {
-                    "id": "vpn",
-                    "name": "VPN",
-                    "device": "wg0",
-                    "ipv4": {"mode": "static", "address": "10.50.0.1/24"},
-                    "ipv6": {"mode": "disabled"},
-                },
-            ],
-        }
-    )
-
-
-def gateways() -> GatewaysConfig:
-    return GatewaysConfig.model_validate(
-        {
-            "version": 1,
-            "gateways": [
-                {
-                    "id": "bbox",
-                    "name": "Bbox",
-                    "interface": "wan",
-                    "address": "192.168.0.254",
-                },
-                {
-                    "id": "special",
-                    "name": "Special",
-                    "interface": "servers",
-                    "address": "10.200.0.1",
-                    "onlink": True,
-                },
-                {
-                    "id": "router-v6",
-                    "name": "IPv6",
-                    "interface": "servers",
-                    "address": "2001:db8:40::fe",
-                },
-                {"id": "vpn-direct", "name": "VPN", "interface": "vpn"},
-            ],
-        }
-    )
-
-
-def routes() -> RoutesConfig:
-    return RoutesConfig.model_validate(
-        {
-            "version": 1,
-            "routes": [
-                {"id": "default-v4", "network": "0.0.0.0/0", "gateway": "bbox"},
-                {"id": "remote-v4", "network": "10.20.0.0/16", "gateway": "special"},
-                {
-                    "id": "remote-v6",
-                    "network": "2001:db8:20::/48",
-                    "gateway": "router-v6",
-                },
-                {
-                    "id": "vpn-network",
-                    "network": "10.50.0.0/16",
-                    "gateway": "vpn-direct",
-                },
-            ],
-        }
-    )
-
-
-def test_gateway_and_route_config_validation() -> None:
-    assert gateways().gateways[0].onlink is False
-    assert str(routes().routes[2].network) == "2001:db8:20::/48"
-    bad = deepcopy(gateways().model_dump(mode="json"))
-    bad["gateways"].append(bad["gateways"][0])
-    with pytest.raises(ValidationError, match="duplicate"):
-        GatewaysConfig.model_validate(bad)
-    with pytest.raises(ValidationError, match="onlink"):
-        GatewaysConfig.model_validate(
+def configuration(gateways=None, routes=None):
+    return desired(
+        [physical(), physical("servers-nic", "eth1")],
+        [
+            interface("wan", ipv4={"mode": "static", "address": "192.168.0.1/24"}),
+            interface(
+                "servers",
+                "servers-nic",
+                ipv4={"mode": "static", "address": "192.168.40.254/24"},
+                ipv6={"mode": "static", "address": "2001:db8:40::1/64"},
+            ),
+        ],
+        gateways
+        if gateways is not None
+        else [
+            {"id": "internet", "interface": "wan", "address": "192.168.0.254"},
             {
-                "version": 1,
-                "gateways": [
-                    {
-                        "id": "direct",
-                        "name": "Direct",
-                        "interface": "wan",
-                        "onlink": True,
-                    }
-                ],
-            }
-        )
-
-
-def test_resolver_validates_references_reachability_and_families() -> None:
-    resolved = resolve_network(interfaces(), gateways(), routes())
-    assert [route.id for route in resolved[1].routes] == ["remote-v4", "remote-v6"]
-    bad_gateway = GatewaysConfig.model_validate(
-        {
-            "version": 1,
-            "gateways": [
-                {"id": "bad", "name": "Bad", "interface": "wan", "address": "10.0.0.1"}
-            ],
-        }
+                "id": "onlink",
+                "interface": "servers",
+                "address": "10.200.0.1",
+                "onlink": True,
+            },
+            {"id": "router-v6", "interface": "servers", "address": "2001:db8:40::fe"},
+            {"id": "direct", "interface": "servers"},
+        ],
+        routes
+        if routes is not None
+        else [
+            {"id": "default-v4", "network": "0.0.0.0/0", "gateway": "internet"},
+            {"id": "remote-v4", "network": "10.20.0.0/16", "gateway": "onlink"},
+            {"id": "remote-v6", "network": "::/0", "gateway": "router-v6"},
+            {"id": "direct-route", "network": "10.50.0.0/16", "gateway": "direct"},
+        ],
     )
-    with pytest.raises(ValueError, match="onlink: true"):
-        resolve_network(interfaces(), bad_gateway, RoutesConfig(routes=[]))
-    bad_routes = RoutesConfig.model_validate(
-        {"version": 1, "routes": [{"id": "bad", "network": "::/0", "gateway": "bbox"}]}
-    )
-    with pytest.raises(ValueError, match="family"):
-        resolve_network(interfaces(), gateways(), bad_routes)
-    unknown = GatewaysConfig.model_validate(
-        {
-            "version": 1,
-            "gateways": [{"id": "bad", "name": "Bad", "interface": "missing"}],
-        }
-    )
-    with pytest.raises(ValueError, match="does not exist"):
-        resolve_network(interfaces(), unknown, RoutesConfig(routes=[]))
 
 
-def test_networkd_renders_deterministic_routes() -> None:
-    desired = NetworkDesiredState(interfaces(), gateways(), routes(), {})
-    candidate = plan_network(desired)
-    assert candidate.files["10-kavernis-wan.network"].endswith(
+def test_routes_render_on_device_of_logical_interface_and_are_deterministic():
+    config = configuration()
+    candidate = plan_network(config)
+    assert candidate.files["10-kavernis-nic.network"].endswith(
         "[Route]\nDestination=0.0.0.0/0\nGateway=192.168.0.254\n"
     )
-    servers = candidate.files["10-kavernis-servers.network"]
+    servers = candidate.files["10-kavernis-servers-nic.network"]
     assert (
         "Destination=10.20.0.0/16\nGateway=10.200.0.1\nGatewayOnLink=yes\n" in servers
     )
-    assert "Destination=2001:db8:20::/48\nGateway=2001:db8:40::fe\n" in servers
-    assert candidate.files["10-kavernis-vpn.network"].endswith(
-        "[Route]\nDestination=10.50.0.0/16\n"
+    assert "Destination=::/0\nGateway=2001:db8:40::fe\n" in servers
+    assert "[Route]\nDestination=10.50.0.0/16\n\n[Route]" in servers
+    reverse = replace(
+        config,
+        routing=config.routing.model_copy(
+            update={
+                "routes": tuple(reversed(config.routing.routes)),
+                "gateways": tuple(reversed(config.routing.gateways)),
+            }
+        ),
     )
-    assert candidate == plan_network(desired)
+    assert candidate == plan_network(reverse)
+
+
+@pytest.mark.parametrize(
+    "gateway,error",
+    [
+        ({"id": "bad", "interface": "wan", "address": "10.0.0.1"}, "onlink: true"),
+        ({"id": "bad", "interface": "missing"}, "does not exist"),
+        ({"id": "bad", "interface": "nic"}, "does not exist"),
+        (
+            {"id": "bad", "interface": "wan", "address": "2001:db8::1", "onlink": True},
+            "family is disabled",
+        ),
+    ],
+)
+def test_gateway_references_reachability_and_families(gateway, error):
+    with pytest.raises(ValueError, match=error):
+        plan_network(configuration(gateways=[gateway], routes=[]))
+
+
+@pytest.mark.parametrize(
+    "route,error",
+    [
+        ({"id": "bad", "network": "::/0", "gateway": "internet"}, "family"),
+        ({"id": "bad", "network": "0.0.0.0/0", "gateway": "missing"}, "does not exist"),
+    ],
+)
+def test_route_references_and_family(route, error):
+    with pytest.raises(ValueError, match=error):
+        plan_network(configuration(routes=[route]))
+
+
+def test_direct_route_requires_enabled_family():
+    config = configuration(
+        gateways=[{"id": "direct", "interface": "wan"}],
+        routes=[{"id": "bad", "network": "::/0", "gateway": "direct"}],
+    )
+    with pytest.raises(ValueError, match="family"):
+        plan_network(config)
+
+
+@pytest.mark.parametrize(
+    "gateway",
+    [
+        {"id": "bad", "interface": "wan", "onlink": True},
+        {"id": "bad", "interface": "wan", "onlink": "true"},
+        {"id": "bad", "interface": "wan", "name": "  "},
+        {"id": "bad", "interface": "wan", "description": ""},
+        {"id": "bad", "interface": "wan", "address": "not-an-ip"},
+    ],
+)
+def test_invalid_gateway_fields(gateway):
+    with pytest.raises(ValidationError):
+        configuration(gateways=[gateway], routes=[])
+
+
+def test_duplicate_routing_ids_are_rejected():
+    gateway = {"id": "direct", "interface": "wan"}
+    route = {"id": "remote", "network": "10.0.0.0/8", "gateway": "direct"}
+    with pytest.raises(ValidationError, match="duplicate"):
+        configuration(gateways=[gateway, gateway], routes=[])
+    with pytest.raises(ValidationError, match="duplicate"):
+        configuration(gateways=[gateway], routes=[route, route])
+
+
+def test_dhcp_use_routes_does_not_suppress_static_routes():
+    config = desired(
+        [physical()],
+        [interface(ipv4={"mode": "dhcp", "dhcp": {"use_routes": False}})],
+        [{"id": "direct", "interface": "lan"}],
+        [{"id": "private", "network": "10.0.0.0/8", "gateway": "direct"}],
+    )
+    native = plan_network(config).files["10-kavernis-nic.network"]
+    assert "UseRoutes=no\n" in native
+    assert "[Route]\nDestination=10.0.0.0/8\n" in native
+
+
+def test_dhcp_gateway_requires_explicit_onlink_without_static_subnet():
+    devices = [physical()]
+    interfaces = [interface(ipv4={"mode": "dhcp"})]
+    gateway = {"id": "router", "interface": "lan", "address": "192.0.2.1"}
+    with pytest.raises(ValueError, match="onlink"):
+        plan_network(desired(devices, interfaces, [gateway]))
+    plan_network(desired(devices, interfaces, [{**gateway, "onlink": True}]))
+
+
+@pytest.mark.parametrize(
+    "address,gateway",
+    [
+        ("192.168.10.0/31", "192.168.10.1"),
+    ],
+)
+def test_ipv4_rfc3021_peer_gateway_is_valid(address, gateway):
+    config = desired(
+        [physical()],
+        [interface(ipv4={"mode": "static", "address": address})],
+        [{"id": "router", "interface": "lan", "address": gateway}],
+        [],
+    )
+    assert "Address=" + address in plan_network(config).files[
+        "10-kavernis-nic.network"
+    ]
+
+
+def test_ipv4_rfc3021_gateway_cannot_be_interface_address():
+    config = desired(
+        [physical()],
+        [interface(ipv4={"mode": "static", "address": "192.168.10.0/31"})],
+        [{"id": "router", "interface": "lan", "address": "192.168.10.0"}],
+        [],
+    )
+    with pytest.raises(ValueError, match="cannot be interface address"):
+        plan_network(config)
+
+
+@pytest.mark.parametrize("onlink", [False, True])
+def test_ipv4_host_prefix_gateway_cannot_be_interface_address(onlink):
+    config = desired(
+        [physical()],
+        [interface(ipv4={"mode": "static", "address": "192.168.10.1/32"})],
+        [
+            {
+                "id": "router",
+                "interface": "lan",
+                "address": "192.168.10.1",
+                "onlink": onlink,
+            }
+        ],
+        [],
+    )
+    with pytest.raises(ValueError, match="cannot be interface address"):
+        plan_network(config)
+
+
+def test_ipv4_host_prefix_external_gateway_requires_onlink():
+    config = desired(
+        [physical()],
+        [interface(ipv4={"mode": "static", "address": "192.168.10.1/32"})],
+        [
+            {
+                "id": "router",
+                "interface": "lan",
+                "address": "192.168.10.254",
+                "onlink": True,
+            }
+        ],
+        [],
+    )
+    plan_network(config)
+    without_onlink = desired(
+        [physical()],
+        [interface(ipv4={"mode": "static", "address": "192.168.10.1/32"})],
+        [{"id": "router", "interface": "lan", "address": "192.168.10.254"}],
+        [],
+    )
+    with pytest.raises(ValueError, match="onlink: true"):
+        plan_network(without_onlink)
+
+
+@pytest.mark.parametrize(
+    "address,gateway",
+    [
+        ("192.0.2.1/24", "192.0.2.0"),
+        ("192.0.2.1/24", "192.0.2.255"),
+        ("192.0.2.1/24", "192.0.2.1"),
+        ("192.0.2.1/24", "0.0.0.0"),
+        ("192.0.2.1/24", "224.0.0.1"),
+        ("192.0.2.1/24", "255.255.255.255"),
+    ],
+)
+def test_onlink_does_not_bypass_invalid_ipv4_next_hop(address, gateway):
+    config = desired(
+        [physical()],
+        [interface(ipv4={"mode": "static", "address": address})],
+        [{"id": "router", "interface": "lan", "address": gateway, "onlink": True}],
+        [],
+    )
+    with pytest.raises(ValueError, match="invalid|cannot be interface"):
+        plan_network(config)
+
+
+def test_ipv6_link_local_gateway_is_valid_without_onlink_and_renders_on_interface():
+    config = desired(
+        [physical()],
+        [interface(ipv6={"mode": "static", "address": "2001:db8::2/64"})],
+        [{"id": "router", "interface": "lan", "address": "fe80::1"}],
+        [{"id": "default", "network": "::/0", "gateway": "router"}],
+    )
+    native = plan_network(config).files["10-kavernis-nic.network"]
+    assert "Gateway=fe80::1\n" in native
+
+
+@pytest.mark.parametrize(
+    "gateway",
+    ["2001:db8::2", "fe80::1"],
+)
+def test_distinct_ipv6_gateway_is_valid(gateway):
+    config = desired(
+        [physical()],
+        [interface(ipv6={"mode": "static", "address": "2001:db8::1/64"})],
+        [{"id": "router", "interface": "lan", "address": gateway}],
+        [],
+    )
+    assert plan_network(config).files["10-kavernis-nic.network"]
+
+
+def test_ipv6_gateway_cannot_be_interface_address():
+    config = desired(
+        [physical()],
+        [interface(ipv6={"mode": "static", "address": "2001:db8::1/64"})],
+        [{"id": "router", "interface": "lan", "address": "2001:db8::1"}],
+        [],
+    )
+    with pytest.raises(ValueError, match="cannot be interface address"):
+        plan_network(config)
+
+
+@pytest.mark.parametrize("gateway", ["::", "ff02::1"])
+def test_onlink_does_not_bypass_invalid_ipv6_next_hop(gateway):
+    config = desired(
+        [physical()],
+        [interface(ipv6={"mode": "static", "address": "2001:db8::2/64"})],
+        [{"id": "router", "interface": "lan", "address": gateway, "onlink": True}],
+        [],
+    )
+    with pytest.raises(ValueError, match="invalid next-hop"):
+        plan_network(config)

@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "BridgeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "members": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Members",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "stp": {
+          "default": true,
+          "title": "Stp",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "members"
+      ],
+      "title": "BridgeConfig",
+      "type": "object"
+    },
+    "BridgeDeviceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 15,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "const": "bridge",
+          "title": "Type",
+          "type": "string"
+        },
+        "bridge": {
+          "$ref": "#/$defs/BridgeConfig"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "type",
+        "bridge"
+      ],
+      "title": "BridgeDeviceConfig",
+      "type": "object"
+    },
+    "PhysicalDeviceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "type": {
+          "const": "physical",
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 15,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9_.:-]+$",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "name"
+      ],
+      "title": "PhysicalDeviceConfig",
+      "type": "object"
+    },
+    "VLANConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "parent": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Parent",
+          "type": "string"
+        },
+        "tag": {
+          "maximum": 4094,
+          "minimum": 1,
+          "title": "Tag",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "parent",
+        "tag"
+      ],
+      "title": "VLANConfig",
+      "type": "object"
+    },
+    "VLANDeviceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 15,
+          "minLength": 1,
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          },
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "const": "vlan",
+          "title": "Type",
+          "type": "string"
+        },
+        "vlan": {
+          "$ref": "#/$defs/VLANConfig"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "type",
+        "vlan"
+      ],
+      "title": "VLANDeviceConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 2,
+      "title": "Version",
+      "type": "integer"
+    },
+    "devices": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "bridge": "#/$defs/BridgeDeviceConfig",
+            "physical": "#/$defs/PhysicalDeviceConfig",
+            "vlan": "#/$defs/VLANDeviceConfig"
+          },
+          "propertyName": "type"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/PhysicalDeviceConfig"
+          },
+          {
+            "$ref": "#/$defs/VLANDeviceConfig"
+          },
+          {
+            "$ref": "#/$defs/BridgeDeviceConfig"
+          }
+        ]
+      },
+      "minItems": 1,
+      "title": "Devices",
+      "type": "array"
+    }
+  },
+  "required": [
+    "version",
+    "devices"
+  ],
+  "title": "DevicesConfig",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

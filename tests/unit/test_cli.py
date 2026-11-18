@@ -1,24 +1,18 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from kavernis import cli
 from kavernis.backends.networkd import NetworkdConfiguration
-from kavernis.core.network import NetworkStateService
-
-
-def write_network_config(path: Path) -> None:
-    (path / "interfaces.yaml").write_text(
-        "version: 1\ninterfaces:\n  - id: lan\n    name: LAN\n    device: eth1\n"
-        "    ipv4: {mode: dhcp}\n    ipv6: {mode: disabled}\n"
-    )
-    (path / "gateways.yaml").write_text("version: 1\ngateways: []\n")
-    (path / "routes.yaml").write_text("version: 1\nroutes: []\n")
+from kavernis.core.network import NetworkStateService, NetworkStatus, NetworkStatusKind
+from kavernis.state.models import ApplyOperationKind, ApplyOutcome, ApplyOutcomeKind
+from network_helpers import write_desired as write_network_config
 
 
 def configure_paths(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     monkeypatch.setattr(cli, "INTERFACES_PATH", str(path / "interfaces.yaml"))
-    monkeypatch.setattr(cli, "GATEWAYS_PATH", str(path / "gateways.yaml"))
-    monkeypatch.setattr(cli, "ROUTES_PATH", str(path / "routes.yaml"))
+    monkeypatch.setattr(cli, "DEVICES_PATH", str(path / "devices.yaml"))
+    monkeypatch.setattr(cli, "ROUTING_PATH", str(path / "routing.yaml"))
     monkeypatch.setattr(cli, "HISTORY_PATH", str(path / "history"))
     monkeypatch.setattr(cli, "STATE_DATABASE_PATH", str(path / "state.db"))
     monkeypatch.setattr(cli, "NETWORKD_PATH", str(path / "networkd"))
@@ -31,7 +25,7 @@ def test_plan_network_is_side_effect_free(
     write_network_config(tmp_path)
     configure_paths(monkeypatch, tmp_path)
     assert cli.main(["plan", "network"]) == 0
-    assert "--- 10-kavernis-lan.network" in capsys.readouterr().out
+    assert "--- 10-kavernis-lan-nic.network" in capsys.readouterr().out
     assert not (tmp_path / "history").exists()
     assert not (tmp_path / "state.db").exists()
 
@@ -41,19 +35,22 @@ def test_apply_network_uses_one_network_transaction(
 ) -> None:
     write_network_config(tmp_path)
     configure_paths(monkeypatch, tmp_path)
-    candidate = NetworkdConfiguration(files={"10-kavernis-lan.network": "content\n"})
+    candidate = NetworkdConfiguration(
+        files={"10-kavernis-lan-nic.network": "content\n"}
+    )
     applied: list[bool] = []
 
-    def apply(
-        _: NetworkStateService, desired: object | None = None
-    ) -> NetworkdConfiguration:
+    def apply(_: NetworkStateService) -> NetworkdConfiguration:
         applied.append(True)
         return candidate
 
     monkeypatch.setattr(NetworkStateService, "apply", apply)
     assert cli.main(["apply", "network"]) == 0
     assert applied == [True]
-    assert capsys.readouterr().out == "Applied 1 systemd-networkd file(s).\n"
+    assert (
+        "Configuration activation and static runtime verified"
+        in capsys.readouterr().out
+    )
 
 
 @pytest.mark.parametrize("action", ["plan", "apply", "status", "history", "diff"])
@@ -62,7 +59,7 @@ def test_interfaces_is_rejected_as_a_cli_resource(action: str) -> None:
         cli.main([action, "interfaces"])
 
 
-@pytest.mark.parametrize("resource", ("interfaces", "gateways", "routes"))
+@pytest.mark.parametrize("resource", ("devices", "interfaces", "routing"))
 def test_edit_accepts_network_resources(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys, resource: str
 ) -> None:
@@ -110,12 +107,35 @@ def test_edit_retries_invalid_candidate_in_same_cli_session(
             path.write_text("routes: [\n")
         else:
             assert path.read_text() == "routes: [\n"
-            path.write_text("version: 1\nroutes: []\n")
+            path.write_text("version: 2\nroutes: []\n")
         return 0
 
     monkeypatch.setattr(cli, "_invoke_editor", editor)
     monkeypatch.setattr("builtins.input", lambda _: "e")
 
-    assert cli.main(["edit", "routes"]) == 0
+    assert cli.main(["edit", "routing"]) == 0
     assert candidates[0] == candidates[1]
     assert "Configuration is invalid:" in capsys.readouterr().err
+
+
+def test_status_prints_synchronization_and_failed_operation_separately(capsys) -> None:
+    cli._print_status(
+        NetworkStatus(
+            NetworkStatusKind.IN_SYNC,
+            "desired",
+            "successful",
+            (),
+            ApplyOutcome(
+                ApplyOperationKind.APPLY,
+                ApplyOutcomeKind.FAILURE,
+                datetime(2026, 1, 1, tzinfo=UTC),
+                "failed",
+                "networkctl reload failed",
+            ),
+        )
+    )
+    output = capsys.readouterr().out
+    assert "Network configuration: in sync" in output
+    assert "Last successful revision: successful" in output
+    assert "Last apply: failed" in output
+    assert "Failure: networkctl reload failed" in output

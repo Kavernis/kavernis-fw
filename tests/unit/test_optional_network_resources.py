@@ -6,32 +6,20 @@ import pytest
 from kavernis.config.errors import ConfigurationError
 from kavernis.core import network as network_core
 from kavernis.core.network import (
-    NetworkStatePaths,
     NetworkStateService,
     load_network,
     plan_network,
 )
-
-
-def service(tmp_path: Path) -> NetworkStateService:
-    desired = tmp_path / "etc"
-    return NetworkStateService(
-        NetworkStatePaths(
-            interfaces_path=desired / "interfaces.yaml",
-            gateways_path=desired / "gateways.yaml",
-            routes_path=desired / "routes.yaml",
-            history_path=tmp_path / "history",
-            database_path=tmp_path / "state.db",
-            networkd_path=tmp_path / "networkd",
-            lock_path=tmp_path / "run/network.lock",
-        )
-    )
+from network_helpers import service
 
 
 def write_dhcp_interfaces(state_service: NetworkStateService) -> None:
     state_service.paths.interfaces_path.parent.mkdir(parents=True, exist_ok=True)
+    state_service.paths.devices_path.write_text(
+        "version: 2\ndevices: [{id: wan-nic, type: physical, name: enp1s0}]\n"
+    )
     state_service.paths.interfaces_path.write_text(
-        "version: 1\ninterfaces:\n  - id: wan\n    name: WAN\n    device: enp1s0\n"
+        "version: 2\ninterfaces:\n  - id: wan\n    name: WAN\n    device: wan-nic\n"
         "    ipv4:\n      mode: dhcp\n"
     )
 
@@ -40,16 +28,15 @@ def test_interfaces_is_mandatory_but_static_resources_are_optional(
     tmp_path: Path,
 ) -> None:
     state_service = service(tmp_path)
-    with pytest.raises(ConfigurationError, match="mandatory interfaces"):
+    with pytest.raises(ConfigurationError, match="mandatory network/devices"):
         load_network(state_service.paths)
 
     write_dhcp_interfaces(state_service)
     desired = load_network(state_service.paths)
-    assert desired.gateways.version == 1
-    assert desired.gateways.gateways == []
-    assert desired.routes.version == 1
-    assert desired.routes.routes == []
-    assert set(desired.files) == {"interfaces.yaml"}
+    assert desired.routing.version == 2
+    assert desired.routing.gateways == ()
+    assert desired.routing.routes == ()
+    assert set(desired.files) == {"network/devices.yaml", "network/interfaces.yaml"}
 
 
 def test_dhcp_only_network_generates_policy_without_fake_static_route(
@@ -59,7 +46,7 @@ def test_dhcp_only_network_generates_policy_without_fake_static_route(
     write_dhcp_interfaces(state_service)
 
     candidate = plan_network(load_network(state_service.paths))
-    content = candidate.files["10-kavernis-wan.network"]
+    content = candidate.files["10-kavernis-wan-nic.network"]
     assert "DHCP=ipv4\n" in content
     assert "[DHCPv4]\n" in content
     assert "UseRoutes=yes\n" in content
@@ -75,20 +62,18 @@ def test_absent_and_explicit_empty_static_resources_are_semantically_equal(
     absent = load_network(state_service.paths)
     absent_candidate = plan_network(absent)
 
-    state_service.paths.gateways_path.write_text("version: 1\ngateways: []\n")
-    state_service.paths.routes_path.write_text("version: 1\nroutes: []\n")
+    state_service.paths.routing_path.write_text("version: 2\nroutes: []\n")
     explicit = load_network(state_service.paths)
 
-    assert absent.gateways == explicit.gateways
-    assert absent.routes == explicit.routes
+    assert absent.routing == explicit.routing
     assert absent_candidate == plan_network(explicit)
 
 
 @pytest.mark.parametrize(
     ("filename", "contents"),
     [
-        ("gateways.yaml", "version: 1\ngateways: [\n"),
-        ("routes.yaml", "version: 2\nroutes: []\n"),
+        ("routing.yaml", "version: 2\ngateways: [\n"),
+        ("routing.yaml", "version: 1\nroutes: []\n"),
     ],
 )
 def test_invalid_existing_optional_resources_are_not_ignored(
@@ -107,14 +92,14 @@ def test_optional_file_presence_is_part_of_concurrency_fingerprint(
     state_service = service(tmp_path)
     write_dhcp_interfaces(state_service)
     absent = state_service.desired_fingerprint()
-    assert absent["gateways.yaml"] == "absent"
-    state_service.paths.gateways_path.write_text("version: 1\ngateways: []\n")
+    assert absent["network/routing.yaml"] == "absent"
+    state_service.paths.routing_path.write_text("version: 2\nroutes: []\n")
     present = state_service.desired_fingerprint()
-    assert present["gateways.yaml"].startswith("present:")
+    assert present["network/routing.yaml"].startswith("present:")
     assert present != absent
 
 
-@pytest.mark.parametrize("resource", ("gateways", "routes"))
+@pytest.mark.parametrize("resource", ("routing",))
 def test_editing_absent_optional_resource_creates_only_a_saved_document(
     tmp_path: Path, resource: str
 ) -> None:
@@ -139,24 +124,27 @@ def test_history_and_rollback_preserve_absent_optional_files(
 ) -> None:
     state_service = service(tmp_path)
     write_dhcp_interfaces(state_service)
-    monkeypatch.setattr(network_core, "apply", lambda *_: None)
+    from network_helpers import fake_activation
+
+    monkeypatch.setattr(network_core, "apply", fake_activation)
     state_service.apply()
     first = state_service.store.get_domain_state("network")
     assert first is not None
 
-    state_service.paths.gateways_path.write_text("version: 1\ngateways: []\n")
-    state_service.paths.routes_path.write_text("version: 1\nroutes: []\n")
+    state_service.paths.routing_path.write_text("version: 2\nroutes: []\n")
     state_service.apply()
     assert set(state_service.history.file_names()) == {
-        "interfaces.yaml",
-        "gateways.yaml",
-        "routes.yaml",
+        "network/devices.yaml",
+        "network/interfaces.yaml",
+        "network/routing.yaml",
     }
 
     state_service.rollback(first.revision)
-    assert not state_service.paths.gateways_path.exists()
-    assert not state_service.paths.routes_path.exists()
-    assert state_service.history.file_names() == ("interfaces.yaml",)
+    assert not state_service.paths.routing_path.exists()
+    assert state_service.history.file_names() == (
+        "network/devices.yaml",
+        "network/interfaces.yaml",
+    )
 
 
 def test_diff_represents_optional_file_creation_and_deletion(tmp_path: Path) -> None:
@@ -165,11 +153,28 @@ def test_diff_represents_optional_file_creation_and_deletion(tmp_path: Path) -> 
     first = state_service.history.snapshot(
         load_network(state_service.paths).files, "initial network desired state"
     )
-    state_service.paths.gateways_path.write_text("version: 1\ngateways: []\n")
+    state_service.paths.routing_path.write_text("version: 2\nroutes: []\n")
     created = load_network(state_service.paths)
-    assert "gateways.yaml (current)" in state_service.diff(created.files, first)
+    assert "network/routing.yaml (current)" in state_service.diff(created.files, first)
 
-    second = state_service.history.snapshot(created.files, "add gateways")
-    state_service.paths.gateways_path.unlink()
+    second = state_service.history.snapshot(created.files, "add routing")
+    state_service.paths.routing_path.unlink()
     current = load_network(state_service.paths)
-    assert "gateways.yaml@" in state_service.diff(current.files, second)
+    assert "network/routing.yaml@" in state_service.diff(current.files, second)
+
+
+@pytest.mark.parametrize("missing", ["devices_path", "interfaces_path"])
+def test_both_documents_are_mandatory(tmp_path, missing):
+    state_service = service(tmp_path)
+    write_dhcp_interfaces(state_service)
+    getattr(state_service.paths, missing).unlink()
+    with pytest.raises(ConfigurationError, match="mandatory"):
+        load_network(state_service.paths)
+
+
+def test_optional_resource_read_error_is_not_treated_as_absence(tmp_path):
+    state_service = service(tmp_path)
+    write_dhcp_interfaces(state_service)
+    state_service.paths.routing_path.mkdir()
+    with pytest.raises(ConfigurationError, match="cannot load network/routing.yaml"):
+        load_network(state_service.paths)
