@@ -421,6 +421,14 @@ def convergence_issues(
     for route in sorted(static_routes(model) - snapshot.routes, key=repr):
         issues.append(f"missing static route {route}")
     if previous is not None:
+        desired_names = {device.name for device in model.devices}
+        for device in previous.devices:
+            if (
+                device.name not in desired_names
+                and isinstance(device.settings, (VLANSettings, BridgeSettings))
+                and device.name in links
+            ):
+                issues.append(f"retired managed virtual device remains: {device.name}")
         for name, address in sorted(
             static_addresses(previous) - static_addresses(model)
         ):

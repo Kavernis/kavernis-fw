@@ -5,6 +5,11 @@ import pytest
 from kavernis import cli
 from kavernis.backends.networkd import NetworkdConfiguration
 from kavernis.core.network import NetworkStateService, NetworkStatus, NetworkStatusKind
+from kavernis.core.network_transition import (
+    NetworkTransitionPlan,
+    TransitionOperation,
+    TransitionOperationKind,
+)
 from kavernis.state.models import ApplyOperationKind, ApplyOutcome, ApplyOutcomeKind
 from network_helpers import write_desired as write_network_config
 
@@ -28,6 +33,39 @@ def test_plan_network_is_side_effect_free(
     assert "--- 10-kavernis-lan-nic.network" in capsys.readouterr().out
     assert not (tmp_path / "history").exists()
     assert not (tmp_path / "state.db").exists()
+
+
+def test_plan_prints_structural_lifecycle_operations(capsys) -> None:
+    cli._print_candidate(
+        NetworkdConfiguration(
+            {"10-kavernis-vlan.network": "[Match]\nName=vlan100\n\n[Network]\n"}
+        ),
+        NetworkTransitionPlan(
+            (),
+            (
+                TransitionOperation(
+                    TransitionOperationKind.DELETE,
+                    "vlan",
+                    "vlan100",
+                    "delete managed VLAN before recreation",
+                ),
+                TransitionOperation(
+                    TransitionOperationKind.CREATE,
+                    "vlan",
+                    "vlan100",
+                    "create managed VLAN",
+                ),
+            ),
+            ("vlan100",),
+            ("vlan100",),
+            ("vlan100",),
+        ),
+    )
+    output = capsys.readouterr().out
+    assert "Network transition plan:" in output
+    assert "DELETE vlan (vlan100)" in output
+    assert "LIVE STRUCTURAL RECONFIGURATION" in output
+    assert "Reboot required: no" in output
 
 
 def test_apply_network_uses_one_network_transaction(

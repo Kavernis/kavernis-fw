@@ -1,9 +1,12 @@
 # Kavernis FW
 
 Kavernis is an early-stage, declarative Linux network and firewall management
-project. Its implemented network controller targets Debian Stable and
-systemd-networkd. YAML describes desired state; generated native configuration
-is an implementation artifact.
+project for **Kavernis OS**. The official platform is Debian 13 (Trixie), using
+its systemd 257 `systemd-networkd` package family and Debian-maintained kernel.
+Kavernis is authoritative for appliance system networking; NetworkManager,
+ifupdown and arbitrary-distribution coexistence are not supported. YAML
+describes desired state; generated native configuration is an implementation
+artifact.
 
 **Declare the desired state. Validate it. Understand the change. Apply it safely.**
 
@@ -194,18 +197,23 @@ fields. External changes during editing cause a conflict instead of an overwrite
 Configuration management tools can provision YAML, but must coordinate writes
 with this same lock; arbitrary unlocked writes cannot be made transactional.
 
-`plan` validates and prints the candidate without changing the host. `apply`
-validates before writing, atomically replaces each owned artifact with mode
-`0644`, removes obsolete owned artifacts, and runs `networkctl reload`.
+`plan` validates and prints the candidate plus a structural transition preview
+without changing the host. `apply` validates before writing, atomically replaces
+each owned artifact with mode `0644`, removes obsolete owned artifacts, and
+runs scoped `networkctl`/`ip` lifecycle actions when a managed VLAN or bridge
+must be recreated. Normal supported VLAN and bridge transitions do not require
+a reboot, but may interrupt traffic on the affected interfaces.
 Artifact names are `10-kavernis-<device-id>.network` and, for VLANs and bridges,
 `10-kavernis-<device-id>.netdev`. Unrelated networkd files are left untouched.
-Apply now checks SQLite readiness and the last applied Git topology before native
-mutation, then verifies required static Linux state after reload before recording
-success. DHCP/SLAAC acquisition and external connectivity are separate from this
-activation guarantee. Unsupported device replacement/removal is rejected before
-mutation, including during rollback. A failed or interrupted native transaction
-attempts file restoration, reload and bounded runtime verification where a known
-baseline exists. This does not guarantee live connectivity recovery. See
+Apply checks SQLite readiness and the last applied Git topology before native
+mutation, then verifies required static Linux state after native convergence
+before recording success. DHCP/SLAAC acquisition and external connectivity are
+separate from this activation guarantee. Physical device removal/recreation and
+ambiguous ownership are rejected before mutation, including during rollback. A
+failed or interrupted native transaction restores artifacts, removes only
+affected managed virtual identities, reloads the previous topology and performs
+bounded runtime verification where a known baseline exists. This does not
+guarantee live connectivity recovery. See
 [network application safety](docs/network-application-safety.md) for exact checks,
 recovery limits and integration-test instructions.
 

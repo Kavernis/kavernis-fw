@@ -18,12 +18,12 @@ from kavernis.backends.network_runtime import (
     verify_runtime,
 )
 from kavernis.backends.networkd import (
+    NetworkBackend,
     NetworkdApplyError,
     NetworkdConfiguration,
+    SystemdNetworkdBackend,
     apply,
-    artifact_hashes,
     generate,
-    inspect_artifact_drift,
 )
 from kavernis.config.errors import ConfigurationError
 from kavernis.config.layout import (
@@ -39,9 +39,12 @@ from kavernis.config.network import (
     parse_document,
 )
 from kavernis.config.resolver import resolve_network
-from kavernis.core.network_transition import validate_transition
+from kavernis.core.network_transition import (
+    NetworkTransitionPlan,
+    draft_transition,
+    plan_transition,
+)
 from kavernis.core.topology import resolve_topology
-from kavernis.models.device import PhysicalSettings
 from kavernis.models.network import NetworkModel
 from kavernis.state.history import DesiredStateHistory
 from kavernis.state.lock import network_lock
@@ -104,6 +107,7 @@ class NetworkStateService:
         history: DesiredStateHistory | None = None,
         store: StateStore | None = None,
         inspector: NetworkRuntimeInspector | None = None,
+        backend: NetworkBackend | None = None,
         verification_timeout: float = 15.0,
         reload_timeout: float = 15.0,
     ) -> None:
@@ -118,6 +122,11 @@ class NetworkStateService:
         self.paths = paths
         self.history = history or DesiredStateHistory(paths.history_path)
         self.store = store or SQLiteStateStore(paths.database_path)
+        # Keep the low-level activation primitive injectable in focused unit
+        # tests while all production orchestration depends on the backend API.
+        self.backend = backend or SystemdNetworkdBackend(
+            activation=lambda *args, **kwargs: apply(*args, **kwargs)
+        )
 
     @contextmanager
     def network_write_transaction(self) -> Iterator[None]:
@@ -267,7 +276,7 @@ class NetworkStateService:
 
     def _prepare_transition(
         self, model: NetworkModel, progress: "_Progress"
-    ) -> NetworkModel | None:
+    ) -> tuple[NetworkModel | None, NetworkTransitionPlan]:
         self.store.preflight(NETWORK_DOMAIN)
         progress.store_ready = True
         applied = self.store.get_domain_state(NETWORK_DOMAIN)
@@ -281,41 +290,85 @@ class NetworkStateService:
                 files, "previous successfully applied revision"
             )
             previous = _resolve(desired)
-            if artifact_hashes(generate(previous)) != dict(applied.artifact_hashes):
+            if self.backend.artifact_hashes(generate(previous)) != dict(
+                applied.artifact_hashes
+            ):
                 raise NetworkdApplyError(
                     "previous applied revision cannot reproduce recorded artifacts; "
                     "cannot safely reconstruct the applied baseline"
                 )
-        elif inspect_artifact_drift({}, self.paths.networkd_path):
+        elif self.backend.inspect_artifact_drift({}, self.paths.networkd_path):
             raise NetworkdApplyError(
                 "managed artifacts exist without an applied baseline; reconcile "
                 "the installation in a controlled maintenance environment"
             )
-        expected = artifact_hashes(generate(previous)) if previous else {}
+        expected = self.backend.artifact_hashes(generate(previous)) if previous else {}
         if any(
             drift.filename.endswith(".netdev") and drift.filename not in expected
-            for drift in inspect_artifact_drift(expected, self.paths.networkd_path)
+            for drift in self.backend.inspect_artifact_drift(
+                expected, self.paths.networkd_path
+            )
         ):
             raise NetworkdApplyError(
                 "unexpected virtual-device artifact has no applied identity; "
                 "cannot safely retire it through reload"
             )
-        validate_transition(
+        transition_plan = plan_transition(
             previous, model, self.inspector.inspect(self.verification_timeout)
         )
-        return previous
+        return previous, transition_plan
+
+    def preview(
+        self, desired: NetworkDesiredState
+    ) -> tuple[NetworkdConfiguration, NetworkTransitionPlan]:
+        """Render a side-effect-free transition preview for the operator.
+
+        If an applied database already exists, the preview reconstructs its
+        immutable model and reads the Linux snapshot so structural operations
+        are shown against the real baseline. A first-use preview has no
+        baseline to inspect and is explicitly a declarative draft only.
+        """
+        candidate = plan_network(desired)
+        model = _resolve(desired)
+        if not self.paths.database_path.exists():
+            return candidate, draft_transition(None, model)
+        applied = self.store.get_domain_state(NETWORK_DOMAIN)
+        if applied is None:
+            return candidate, draft_transition(None, model)
+        files = {
+            name: self.history.read_revision(applied.revision, name)
+            for name in self.history.file_names(applied.revision)
+        }
+        previous = _resolve(
+            desired_from_files(files, "previous successfully applied revision")
+        )
+        if self.backend.artifact_hashes(generate(previous)) != dict(
+            applied.artifact_hashes
+        ):
+            raise NetworkdApplyError(
+                "previous applied revision cannot reproduce recorded artifacts; "
+                "cannot safely construct a structural plan"
+            )
+        return candidate, plan_transition(
+            previous, model, self.inspector.inspect(self.verification_timeout)
+        )
 
     def _activate(
         self,
         candidate: NetworkdConfiguration,
         model: NetworkModel,
         previous: NetworkModel | None,
+        transition_plan: NetworkTransitionPlan,
         revision: str,
         operation: ApplyOperationKind,
         progress: "_Progress",
     ) -> None:
-        recovery_matches = previous is not None and not inspect_artifact_drift(
-            artifact_hashes(generate(previous)), self.paths.networkd_path
+        recovery_matches = (
+            previous is not None
+            and not self.backend.inspect_artifact_drift(
+                self.backend.artifact_hashes(generate(previous)),
+                self.paths.networkd_path,
+            )
         )
 
         def verify() -> None:
@@ -340,32 +393,17 @@ class NetworkStateService:
                 model,
                 timeout=self.verification_timeout,
             )
-            old_names = {d.name for d in previous.devices}
-            added = {
-                d.name
-                for d in model.devices
-                if not isinstance(d.settings, PhysicalSettings)
-            } - old_names
-            remaining = added & {
-                link.name
-                for link in self.inspector.inspect(self.verification_timeout).links
-            }
-            if remaining:
-                raise RuntimeVerificationError(
-                    f"new devices remain after recovery: {sorted(remaining)}; "
-                    "automatic deletion is unsupported"
-                )
 
         def record() -> None:
             self.store.record_successful_apply(
                 NETWORK_DOMAIN,
                 revision,
-                artifact_hashes(candidate),
+                self.backend.artifact_hashes(candidate),
                 operation,
                 commit=progress.commit,
             )
 
-        apply(
+        self.backend.activate(
             candidate,
             self.paths.networkd_path,
             verify=verify,
@@ -373,6 +411,7 @@ class NetworkStateService:
             record=record,
             commit=progress.commit,
             reload_timeout=self.reload_timeout,
+            transition_plan=transition_plan,
         )
 
     def apply(self) -> NetworkdConfiguration:
@@ -384,7 +423,7 @@ class NetworkStateService:
             candidate = plan_network(desired)
             self._require_current(desired.files)
             model = _resolve(desired)
-            previous = self._prepare_transition(model, progress)
+            previous, transition_plan = self._prepare_transition(model, progress)
             revision = self.history.snapshot(
                 desired.files, "apply network desired state"
             )
@@ -392,7 +431,13 @@ class NetworkStateService:
             self._require_current(desired.files)
             progress.phase = "native transaction (recovery details below)"
             self._activate(
-                candidate, model, previous, revision, ApplyOperationKind.APPLY, progress
+                candidate,
+                model,
+                previous,
+                transition_plan,
+                revision,
+                ApplyOperationKind.APPLY,
+                progress,
             )
         return candidate
 
@@ -421,7 +466,7 @@ class NetworkStateService:
                     last_outcome,
                 )
             desired_revision = applied.revision
-        drift = inspect_artifact_drift(
+        drift = self.backend.inspect_artifact_drift(
             applied.artifact_hashes, self.paths.networkd_path
         )
         return NetworkStatus(
@@ -475,7 +520,7 @@ class NetworkStateService:
             desired = desired_from_files(files, f"revision {revision}")
             candidate = plan_network(desired)
             model = _resolve(desired)
-            applied_model = self._prepare_transition(model, progress)
+            applied_model, transition_plan = self._prepare_transition(model, progress)
             # Do not overwrite an uncommitted desired state during recovery. Its
             # exact bytes and optional-resource presence become a normal immutable
             # desired-state revision, never an applied-state revision.
@@ -518,6 +563,7 @@ class NetworkStateService:
                 candidate,
                 model,
                 applied_model,
+                transition_plan,
                 new_revision,
                 ApplyOperationKind.ROLLBACK,
                 progress,

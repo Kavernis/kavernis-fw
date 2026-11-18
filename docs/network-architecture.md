@@ -132,12 +132,14 @@ SQLite; the CLI's status categories remain the existing four categories.
 
 ## Operational limits
 
-`networkctl reload` remains the activation mechanism. Its successful return alone
-is insufficient: the backend observes Linux and networkd through a typed runtime
-inspector and core requires static verification before success recording.
+`SystemdNetworkdBackend` is the Debian 13/systemd 257 production activation
+boundary. `networkctl reload` alone is insufficient: for planned VLAN/bridge
+changes it coordinates scoped detachment/deletion, target reload and targeted
+reconfigure operations. The backend observes Linux and networkd through a typed
+runtime inspector and core requires static verification before success recording.
 Dynamic acquisition, reachability and continued management connectivity are not
-verified. Automatic virtual-device recreation/retirement and watchdog recovery
-remain unsupported; structural transitions requiring them are rejected.
+verified. Physical device recreation, ambiguous ownership and watchdog recovery
+remain unsupported and fail closed.
 
 Replacement is atomic per file, not a crash-atomic transaction spanning all YAML
 files, native files, Git and SQLite. Advisory locking cannot protect against

@@ -10,6 +10,11 @@ from kavernis.backends.networkd import (
     NetworkdValidationError,
     validate,
 )
+from kavernis.core.network_transition import (
+    NetworkTransitionPlan,
+    TransitionOperation,
+    TransitionOperationKind,
+)
 
 
 def test_reject_unsafe_generated_candidate() -> None:
@@ -276,3 +281,107 @@ def test_interrupt_reading_artifact_baseline_does_not_start_recovery(
         )
     assert caught.value is interruption
     assert "before native mutation" in " ".join(interruption.__notes__)
+
+
+def test_structural_lifecycle_uses_scoped_netlink_commands_in_order(
+    tmp_path, monkeypatch
+):
+    from kavernis.backends import networkd
+
+    calls = []
+
+    def run(arguments, **kwargs):
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(networkd.subprocess, "run", run)
+    plan = NetworkTransitionPlan(
+        (),
+        (
+            TransitionOperation(
+                TransitionOperationKind.DETACH,
+                "vlan",
+                "vlan100",
+                "detach from bridge",
+            ),
+            TransitionOperation(
+                TransitionOperationKind.DELETE,
+                "vlan",
+                "vlan100",
+                "delete old VLAN",
+            ),
+            TransitionOperation(
+                TransitionOperationKind.RELOAD,
+                "networkd",
+                "networkd",
+                "reload target artifacts",
+            ),
+            TransitionOperation(
+                TransitionOperationKind.CREATE,
+                "vlan",
+                "vlan100",
+                "recreate VLAN",
+            ),
+        ),
+        ("vlan100",),
+        ("vlan100",),
+        ("vlan100",),
+    )
+    networkd.apply(
+        NetworkdConfiguration(
+            {"10-kavernis-vlan.network": "[Match]\nName=vlan100\n\n[Network]\n"}
+        ),
+        tmp_path,
+        transition_plan=plan,
+    )
+    assert calls == [
+        ["networkctl", "reload"],
+        ["ip", "link", "set", "dev", "vlan100", "nomaster"],
+        ["ip", "link", "delete", "dev", "vlan100"],
+        ["networkctl", "reload"],
+        ["networkctl", "reconfigure", "vlan100"],
+    ]
+
+
+def test_structural_recovery_removes_only_plan_owned_virtual_identities(
+    tmp_path, monkeypatch
+):
+    from kavernis.backends import networkd
+
+    calls = []
+
+    def run(arguments, **kwargs):
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(networkd.subprocess, "run", run)
+    (tmp_path / "10-kavernis-old.network").write_text(
+        "[Match]\nName=old0\n\n[Network]\n"
+    )
+    plan = NetworkTransitionPlan(
+        (),
+        (
+            TransitionOperation(
+                TransitionOperationKind.DELETE,
+                "old",
+                "old0",
+                "replace old virtual",
+            ),
+        ),
+        ("old0",),
+        ("new0",),
+        ("old0", "new0"),
+    )
+    with pytest.raises(RuntimeError, match="verification failed"):
+        networkd.apply(
+            NetworkdConfiguration(
+                {"10-kavernis-new.network": "[Match]\nName=new0\n\n[Network]\n"}
+            ),
+            tmp_path,
+            transition_plan=plan,
+            verify=lambda: (_ for _ in ()).throw(RuntimeError("verification failed")),
+        )
+    assert ["ip", "link", "delete", "dev", "old0"] in calls
+    assert ["ip", "link", "delete", "dev", "new0"] in calls
+    assert (tmp_path / "10-kavernis-old.network").exists()
+    assert not (tmp_path / "10-kavernis-new.network").exists()

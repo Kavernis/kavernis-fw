@@ -288,6 +288,19 @@ def test_retired_static_values_must_disappear():
     assert sum("retired static route" in issue for issue in issues) == 1
 
 
+def test_retired_managed_virtual_device_must_disappear():
+    before = topology()
+    after = replace(
+        before,
+        devices=(before.devices[0],),
+        interfaces=(),
+        routing=type(before.routing)(),
+    )
+    issues = convergence_issues(after, snapshot(), DIRECTORY, before)
+    assert "retired managed virtual device remains: vlan30" in issues
+    assert "retired managed virtual device remains: br0" in issues
+
+
 def json_documents():
     return [
         [

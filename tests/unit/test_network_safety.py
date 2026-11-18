@@ -12,7 +12,6 @@ from kavernis.backends.network_runtime import (
     RuntimeVerificationError,
 )
 from kavernis.core import network as core
-from kavernis.core.network_transition import UnsupportedNetworkTransition
 from kavernis.state.models import ApplyOutcomeKind
 from kavernis.state.sqlite import StateStoreError
 from network_helpers import service, write_desired
@@ -231,7 +230,7 @@ def test_late_sqlite_failure_recovers_and_records_failure(
 
 
 @pytest.mark.parametrize("virtual", ["vlan", "bridge"])
-def test_structural_rollback_rejected_before_desired_replacement(
+def test_structural_rollback_executes_lifecycle_before_desired_replacement(
     tmp_path, monkeypatch, native, virtual
 ):
     state = service(tmp_path)
@@ -275,18 +274,18 @@ def test_structural_rollback_rejected_before_desired_replacement(
     state.apply()  # Initial creation must still work, including bridge attachments.
     previous = core.load_network(state.paths).files
     old_artifacts = artifacts(state)
-    with pytest.raises(UnsupportedNetworkTransition, match="removal"):
-        state.rollback(old_revision)
-    assert core.load_network(state.paths).files == previous
-    assert artifacts(state) == old_artifacts
-    assert len(native) == 2
-    if virtual == "vlan":
-        data["devices"][-1]["vlan"]["tag"] = 40
-        state.paths.devices_path.write_text(yaml.safe_dump(data))
-        with pytest.raises(UnsupportedNetworkTransition, match="tag=40"):
-            state.apply()
-        assert artifacts(state) == old_artifacts
-        assert len(native) == 2
+    calls = []
+
+    def lifecycle(_self, plan):
+        calls.extend(plan.operations)
+
+    monkeypatch.setattr(
+        networkd.NativeNetworkdOperations, "execute_lifecycle", lifecycle
+    )
+    state.rollback(old_revision)
+    assert core.load_network(state.paths).files != previous
+    assert artifacts(state) != old_artifacts
+    assert any(operation.kind.value == "delete" for operation in calls)
 
 
 def test_rollback_interruption_reports_changed_desired(tmp_path, monkeypatch, native):
@@ -412,9 +411,19 @@ def test_leftover_new_virtual_device_is_not_reported_as_recovered(
 
     monkeypatch.setattr(state.inspector, "inspect", inspect)
     monkeypatch.setattr(state.store, "record_successful_apply", fail_record)
+    # Keep the simulated kernel link present after recovery cleanup so this
+    # test exercises the fail-closed verification path rather than attempting
+    # a real host netlink delete.
+    monkeypatch.setattr(
+        networkd.NativeNetworkdOperations,
+        "remove_recovery_identities",
+        lambda *_: None,
+    )
     with pytest.raises(StateStoreError) as caught:
         state.apply()
-    assert "new devices remain after recovery" in " ".join(caught.value.__notes__)
+    assert "retired managed virtual device remains: vlan30" in " ".join(
+        caught.value.__notes__
+    )
     assert not (state.paths.networkd_path / "10-kavernis-vlan.netdev").exists()
 
 

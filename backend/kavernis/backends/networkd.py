@@ -10,8 +10,13 @@ from dataclasses import asdict, dataclass
 from ipaddress import ip_address, ip_interface, ip_network
 from math import isfinite
 from pathlib import Path
+from typing import Protocol
 
 from kavernis.backends.network_runtime import effective_onlink
+from kavernis.core.network_transition import (
+    NetworkTransitionPlan,
+    TransitionOperationKind,
+)
 from kavernis.models.device import BridgeSettings, VLANSettings
 from kavernis.models.interface import (
     InterfaceAddressing,
@@ -39,11 +44,168 @@ class NetworkdApplyError(RuntimeError):
     """Raised when a generated networkd candidate cannot be activated."""
 
 
+class NativeNetworkdOperations:
+    """The only production boundary that executes networkd/netlink commands.
+
+    Commands deliberately operate on names emitted by a validated transition
+    plan. The plan contains only managed virtual devices for delete operations;
+    physical links are never removed or recreated.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        self.timeout = timeout
+
+    def reload(self, *, check: bool) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["networkctl", "reload"],
+            check=check,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+        )
+
+    def execute_lifecycle(self, plan: NetworkTransitionPlan) -> None:
+        for operation in plan.operations:
+            if operation.kind is TransitionOperationKind.DETACH:
+                self._ip(["link", "set", "dev", operation.device_name, "nomaster"])
+            elif operation.kind is TransitionOperationKind.DELETE:
+                self._ip(["link", "delete", "dev", operation.device_name])
+
+    def reconfigure_target(self, plan: NetworkTransitionPlan) -> None:
+        names = sorted(
+            {
+                operation.device_name
+                for operation in plan.operations
+                if operation.kind
+                in (
+                    TransitionOperationKind.CREATE,
+                    TransitionOperationKind.ATTACH,
+                )
+            }
+        )
+        for name in names:
+            subprocess.run(
+                ["networkctl", "reconfigure", name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+
+    def remove_recovery_identities(self, plan: NetworkTransitionPlan) -> None:
+        for name in plan.recovery_delete_names:
+            result = subprocess.run(
+                ["ip", "link", "delete", "dev", name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+            if result.returncode and not _missing_link(result.stderr):
+                raise NetworkdApplyError(
+                    f"cannot remove managed virtual device {name} during recovery: "
+                    f"{result.stderr.strip() or result.returncode}"
+                )
+
+    def _ip(self, arguments: list[str]) -> None:
+        subprocess.run(
+            ["ip", *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+        )
+
+
+def _missing_link(stderr: str) -> bool:
+    return "Cannot find device" in stderr or "does not exist" in stderr
+
+
 @dataclass(frozen=True)
 class NetworkdConfiguration:
     """Generated files, kept in memory until a future safe apply operation."""
 
     files: Mapping[str, str]
+
+
+class NetworkBackend(Protocol):
+    """Minimal boundary used by network-state orchestration.
+
+    The sole implementation is Debian 13's systemd-networkd backend. Keeping
+    this protocol small prevents native command details from leaking into the
+    domain/state layer without creating a runtime plugin framework.
+    """
+
+    def artifact_hashes(self, candidate: NetworkdConfiguration) -> dict[str, str]: ...
+
+    def inspect_artifact_drift(
+        self, expected_hashes: Mapping[str, str], directory: Path
+    ) -> tuple[ArtifactDrift, ...]: ...
+
+    def activate(
+        self,
+        candidate: NetworkdConfiguration,
+        directory: Path,
+        *,
+        verify: Callable[[], None] | None,
+        verify_recovery: Callable[[], None] | None,
+        record: Callable[[], None] | None,
+        commit: ApplyCommit | None,
+        reload_timeout: float,
+        transition_plan: NetworkTransitionPlan | None,
+    ) -> None: ...
+
+
+class SystemdNetworkdBackend:
+    """Small production backend facade for Debian 13 systemd-networkd.
+
+    The domain and transition planner pass backend-neutral models/plans here;
+    this implementation alone owns networkd rendering, artifact activation, and
+    the scoped netlink lifecycle commands.
+    """
+
+    def __init__(self, activation: Callable[..., None] | None = None) -> None:
+        # The optional composition hook keeps the public low-level ``apply``
+        # primitive independently testable without adding a second backend.
+        self._activation = activation
+
+    def render(self, model: NetworkModel) -> NetworkdConfiguration:
+        return generate(model)
+
+    def validate(self, candidate: NetworkdConfiguration) -> None:
+        validate(candidate)
+
+    def artifact_hashes(self, candidate: NetworkdConfiguration) -> dict[str, str]:
+        return artifact_hashes(candidate)
+
+    def inspect_artifact_drift(
+        self, expected_hashes: Mapping[str, str], directory: Path
+    ) -> tuple[ArtifactDrift, ...]:
+        return inspect_artifact_drift(expected_hashes, directory)
+
+    def activate(
+        self,
+        candidate: NetworkdConfiguration,
+        directory: Path,
+        *,
+        verify: Callable[[], None] | None,
+        verify_recovery: Callable[[], None] | None,
+        record: Callable[[], None] | None,
+        commit: ApplyCommit | None,
+        reload_timeout: float,
+        transition_plan: NetworkTransitionPlan | None,
+    ) -> None:
+        activation = self._activation or apply
+        activation(
+            candidate,
+            directory,
+            verify=verify,
+            verify_recovery=verify_recovery,
+            record=record,
+            commit=commit,
+            reload_timeout=reload_timeout,
+            transition_plan=transition_plan,
+        )
 
 
 @dataclass(frozen=True)
@@ -202,6 +364,7 @@ def apply(
     record: Callable[[], None] | None = None,
     commit: ApplyCommit | None = None,
     reload_timeout: float = 15.0,
+    transition_plan: NetworkTransitionPlan | None = None,
 ) -> None:
     """Install/reload within a narrow recovery boundary, then verify and record.
 
@@ -219,6 +382,7 @@ def apply(
         error.add_note("apply interrupted before native mutation; recovery not needed")
         raise
     phase = "artifact mutation"
+    operations = NativeNetworkdOperations(reload_timeout)
     try:
         directory.mkdir(parents=True, exist_ok=True)
         for filename, content in candidate.files.items():
@@ -227,13 +391,13 @@ def apply(
             (directory / filename).unlink()
         _sync_directory(directory)
         phase = "native reload"
-        subprocess.run(
-            ["networkctl", "reload"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=reload_timeout,
-        )
+        operations.reload(check=True)
+        if transition_plan is not None and transition_plan.requires_lifecycle:
+            phase = "native device lifecycle"
+            operations.execute_lifecycle(transition_plan)
+            phase = "native recreation"
+            operations.reload(check=True)
+            operations.reconfigure_target(transition_plan)
         phase = "runtime verification"
         if verify is not None:
             verify()
@@ -255,7 +419,13 @@ def apply(
                 "native recovery not attempted; inspect SQLite and Linux"
             )
             raise
-        recovery = _recover(directory, previous, verify_recovery, reload_timeout)
+        recovery = _recover(
+            directory,
+            previous,
+            verify_recovery,
+            operations,
+            transition_plan,
+        )
         detail = f"apply failed during {phase}: {error}; {recovery}"
         if isinstance(error, subprocess.CalledProcessError):
             detail += f"; {error.stderr}"
@@ -269,7 +439,8 @@ def _recover(
     directory: Path,
     previous: Mapping[str, bytes],
     verify: Callable[[], None] | None,
-    timeout: float,
+    operations: NativeNetworkdOperations,
+    transition_plan: NetworkTransitionPlan | None,
 ) -> str:
     """Best effort cleanup, reporting each boundary without losing the cause."""
     try:
@@ -277,13 +448,9 @@ def _recover(
     except BaseException as error:
         return f"artifact recovery failed: {type(error).__name__}: {error}"
     try:
-        recovery = subprocess.run(
-            ["networkctl", "reload"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        if transition_plan is not None and transition_plan.recovery_delete_names:
+            operations.remove_recovery_identities(transition_plan)
+        recovery = operations.reload(check=False)
         if recovery.returncode:
             return (
                 "previous files restored but recovery reload failed: "

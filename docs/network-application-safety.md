@@ -1,4 +1,13 @@
-# Network application safety (Lot A)
+# Network application safety
+
+## Platform contract
+
+Kavernis OS supports Debian 13 (Trixie), its systemd 257 package family and the
+Debian-maintained kernel. `SystemdNetworkdBackend` is the single production
+network backend. Its small backend boundary keeps the domain, transition plan,
+Git history and SQLite receipts independent of command syntax; it is not a
+multi-distribution compatibility layer. Kavernis owns appliance networking, but
+never uses that authority to delete an unowned kernel interface.
 
 ## Success means verified static activation
 
@@ -14,9 +23,15 @@ Apply and rollback now follow these boundaries:
    incompatible or unreproducible history fails safely. SQLite holds metadata,
    not a duplicate desired topology.
 3. Classify transitions by device ID/settings/dependencies; check observed Linux
-   topology before assuming reload is safe. No kernel device is deleted.
-4. Snapshot desired state, atomically replace individual managed artifacts,
-   remove supported obsolete artifacts, fsync, then reload networkd.
+   topology before assuming a managed structural change is safe. Physical kernel
+   devices are never deleted or recreated.
+4. Snapshot desired state, atomically replace individual managed artifacts and
+   fsync. For an affected virtual topology, load target artifacts with
+   `networkctl reload`, detach only planned bridge members, delete only planned
+   managed VLAN/bridge links with `ip link`, reload target artifacts, and issue
+   scoped `networkctl reconfigure` calls for target devices. This avoids a full
+   `systemd-networkd` restart and prevents an old on-disk netdev definition from
+   recreating a deleted device.
 5. Inspect actual Linux/networkd state with bounded polling. Only after the
    required checks pass, record success and artifact hashes in SQLite.
 
@@ -38,6 +53,7 @@ and [iproute2 link output](https://github.com/iproute2/iproute2/blob/main/lib/ut
 | Static addresses | Expected IPv4/IPv6 address and prefix present; tentative or DAD-failed addresses do not count |
 | Static routes | Canonical destination, gateway or direct route, output device and onlink flag; main table, static protocol, unicast |
 | Retired static configuration | Addresses and complete route identities in the previous model but absent from the candidate must disappear |
+| Retired managed virtual devices | A previous VLAN or bridge absent from target intent must no longer exist |
 
 Additional kernel, link-local, dynamic and unrelated routes/addresses are allowed.
 Route destination alone is never used as ownership. Route protocol alone also
@@ -68,17 +84,28 @@ continuous runtime monitor.
 
 ## Supported and rejected transitions
 
-Supported: initial physical adoption, initial VLAN/bridge creation when no
-unowned name collision exists, initial attachments, unchanged topology, static
-address/route additions/changes/removals, and existing DHCPv4/DHCPv6/SLAAC intent.
-All supported transitions still have to pass runtime verification.
+Supported with live structural lifecycle operations: initial VLAN/bridge
+creation, VLAN tag or parent change, virtual-device name/type replacement,
+VLAN/bridge removal, bridge member addition/removal, bridge STP changes, and a
+VLAN attached to a bridge. The planner destroys dependants before dependencies:
+it detaches old bridge members, deletes an affected bridge, deletes affected
+VLANs, reloads target artifacts, then reconfigures target virtual devices and
+attachments. Static address/route changes and DHCPv4/DHCPv6/SLAAC intent retain
+their normal reload path. All supported transitions still have to pass exact
+runtime topology and required-static-L3 verification before success is recorded.
 
-Rejected before native mutation: changing device type or kernel name, changing
-VLAN tag/parent, removing a VLAN or bridge, changing existing bridge membership
-or STP, and retiring a physical device declaration. The last two are deliberately
-conservative: reload-only detachment/reconfiguration is not demonstrated safe.
-A new bridge may attach an existing unmastered physical/VLAN member; an existing
-bridge's membership cannot be edited live by this backend.
+Deleting a bridge detaches but never deletes its physical members. Changing a
+VLAN parent or tag affects only that VLAN identity; unrelated managed VLANs are
+not included in the transition plan. A `kavernis plan network` preview displays
+the ordered operations and marks a structural operation as potentially
+connectivity-disruptive. It is side-effect free; before a first applied baseline
+exists it is a declarative preview, not proof that physical adoption will pass.
+
+Rejected before native mutation: retiring, renaming, or recreating a physical
+device declaration; adopting a missing/enslaved/non-physical link; an unowned
+virtual name collision; any applied-topology drift; or a transition whose device
+identity cannot be established safely. Rollback uses the same checks **before
+replacing live YAML**.
 
 New virtual names already present in Linux, missing expected physical devices,
 conflicting initial bridge membership, applied topology drift, managed artifacts
@@ -90,19 +117,22 @@ kernel cleanup. Rollback uses the same checks **before replacing live YAML**.
 ## Interruption and recovery
 
 The backend's narrow `BaseException` boundary begins at persistent native
-mutation and includes reload, verification and state recording. On a catchable
-failure, including `KeyboardInterrupt` and `SystemExit`, it attempts to restore
-the exact prior artifact bytes, reload them and verify the prior static model.
-The original cancellation is re-raised. Recovery failure is attached to that
-exception and printed by the CLI; secondary outcome-recording failures do not
-hide the cause.
+mutation and includes reload, structural lifecycle operations, verification and
+state recording. On a catchable failure, including `KeyboardInterrupt` and
+`SystemExit`, it restores the exact prior artifact bytes, removes only virtual
+identities belonging to the failed transition (bridges before dependent VLANs),
+reloads networkd so the previous topology is recreated, and verifies the prior
+static model. The original cancellation is re-raised. Recovery failure is
+attached to that exception and printed by the CLI; secondary outcome-recording
+failures do not hide the cause.
 
 File restoration and successful recovery reload are reported separately from
 runtime recovery. Without a prior applied baseline matching the restored files,
-runtime restoration is explicitly unverified. A newly created virtual device may
-survive restoration; it is never automatically deleted, and recovery reports the
-remaining device instead of claiming restoration succeeded. Even verified prior
-static properties do not prove restored connectivity or dynamic leases.
+runtime restoration is explicitly unverified. Recovery does not touch physical
+links or unexpected devices; if its scoped cleanup cannot remove an affected
+virtual device, it reports incomplete recovery rather than claiming success.
+Even verified prior static properties do not prove restored connectivity or
+dynamic leases.
 
 Before native mutation, rollback interruption during YAML replacement/history
 creation attempts restoration of the outgoing desired resource set. Once the
@@ -117,6 +147,14 @@ SIGKILL, default unhandled SIGTERM, power loss, kernel failure and repeated
 interruption of cleanup cannot be recovered by this exception boundary. There is
 no watchdog, remote-confirmation timer or crash-atomic network transaction.
 Recovery does not guarantee preservation of an SSH session.
+
+Apply structural changes from the appliance's local VM or physical console when
+the affected device carries management traffic. If access is lost, use that
+console to inspect `kavernis status network`, `networkctl status` and `ip -d
+link`, then either run `kavernis rollback network <revision>` or restore a known
+valid desired-state revision and apply it. Do not manually delete arbitrary
+interfaces to force convergence: Kavernis deliberately fails closed when it
+cannot establish ownership.
 
 ## SQLite preflight and remaining windows
 
@@ -179,12 +217,14 @@ sudo env KAVERNIS_DISPOSABLE_NETWORKD_VM=1 .venv/bin/pytest -q tests/integration
 
 The test also requires root and VM detection. It creates only named test devices,
 uses temporary YAML/Git/SQLite paths and `/run/systemd/network` artifacts, and
-checks initial activation, static address update, desired-state rollback and
-structural rejection. Cleanup is limited to fixture-created objects. It has not
+checks initial activation, static address update, desired-state rollback, VLAN
+tag/parent recreation, bridge membership/STP changes, virtual deletion,
+preservation of an unrelated VLAN, and recovery at two points in the VLAN
+lifecycle sequence. Cleanup is limited to fixture-created objects. It has not
 been executed in this environment. Normal `pytest` skips both opt-in integrations.
 Real networkd reconfiguration, timing under load, dynamic-policy acceptance and
-remote connectivity remain unvalidated operational assumptions until these tests
-and broader disposable-host scenarios run successfully.
+remote connectivity remain unvalidated operational assumptions until these
+tests and broader disposable-host scenarios run successfully.
 
 Recovery has separate real-networkd scenarios. Run them only on that same kind
 of disposable VM:

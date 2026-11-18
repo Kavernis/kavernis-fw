@@ -19,8 +19,8 @@ from kavernis.core.network import (
     NetworkStateService,
     NetworkStatus,
     load_network,
-    plan_network,
 )
+from kavernis.core.network_transition import NetworkTransitionPlan
 from kavernis.state.history import HistoryError
 from kavernis.state.lock import LockUnavailableError
 from kavernis.state.models import ApplyOutcomeKind
@@ -95,7 +95,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         else:
             desired = load_network(service.paths)
             if parsed.action == "plan":
-                _print_candidate(plan_network(desired))
+                candidate, transition = service.preview(desired)
+                _print_candidate(candidate, transition)
             else:
                 if parsed.action == "status":
                     _print_status(service.status(desired.files))
@@ -137,8 +138,30 @@ def main(arguments: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _print_candidate(candidate: NetworkdConfiguration) -> None:
+def _print_candidate(
+    candidate: NetworkdConfiguration,
+    transition: NetworkTransitionPlan | None = None,
+) -> None:
     """Render a deterministic, reviewable plan to standard output."""
+    if transition is not None:
+        print("Network transition plan:")
+        if transition.operations:
+            for operation in transition.operations:
+                print(
+                    f"  {operation.kind.value.upper()} {operation.device_id} "
+                    f"({operation.device_name}): {operation.detail}"
+                )
+        else:
+            print("  RELOAD networkd artifacts and L3 configuration")
+        print()
+        mode = (
+            "LIVE STRUCTURAL RECONFIGURATION"
+            if transition.has_structural_operations
+            else "NETWORKD RELOAD"
+        )
+        print(f"Apply mode: {mode}")
+        print("Reboot required: no")
+        print()
     for index, (filename, content) in enumerate(sorted(candidate.files.items())):
         if index:
             print()
