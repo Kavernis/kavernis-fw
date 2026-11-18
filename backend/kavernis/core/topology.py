@@ -132,16 +132,16 @@ def _validate_routing(model: NetworkModel) -> None:
             and address == IPv4Address("255.255.255.255")
         ):
             raise ValueError(f"gateway {gateway.id}: invalid next-hop address")
+        if family.address is not None and address == family.address.ip:
+            raise ValueError(
+                f"gateway {gateway.id}: gateway cannot be interface address"
+            )
         if isinstance(address, IPv6Address) and address.is_link_local:
             # IPv6 link-local scope is inherently tied to this interface. The
             # generated [Route] already binds to the interface's .network file.
             continue
         if isinstance(address, IPv4Address) and family.address is not None:
             subnet = family.address.network
-            if address == family.address.ip:
-                raise ValueError(
-                    f"gateway {gateway.id}: gateway cannot be interface address"
-                )
             # RFC 3021 makes both /31 addresses usable point-to-point endpoints;
             # a /32 has no distinct subnet or broadcast address to exclude.
             if subnet.prefixlen <= 30 and address in (

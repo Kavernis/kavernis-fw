@@ -20,7 +20,9 @@ Identifier = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]*$")]
 DeviceName = Annotated[
     str,
     Field(
-        pattern=r"^[A-Za-z0-9_.:-]+$", json_schema_extra={"not": {"enum": [".", ".."]}}
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+        max_length=15,
+        json_schema_extra={"not": {"enum": [".", ".."]}},
     ),
 ]
 VirtualName = Annotated[

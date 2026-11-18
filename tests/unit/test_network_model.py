@@ -79,6 +79,12 @@ def test_unknown_interface_device_and_kernel_name_reference_rejected():
             plan_network(desired([physical()], [interface(device=ref)]))
 
 
+def test_physical_device_name_length_boundaries():
+    assert desired([physical(name="e" * 15)]).devices.devices[0].name == "e" * 15
+    with pytest.raises(ValidationError, match="name"):
+        desired([physical(name="e" * 16)])
+
+
 def test_domain_callers_also_receive_duplicate_validation():
     resolved = model(desired([physical()], [interface()]))
     with pytest.raises(ValueError, match="duplicate device id"):

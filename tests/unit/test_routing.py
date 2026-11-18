@@ -255,6 +255,31 @@ def test_ipv6_link_local_gateway_is_valid_without_onlink_and_renders_on_interfac
     assert "Gateway=fe80::1\n" in native
 
 
+@pytest.mark.parametrize(
+    "gateway",
+    ["2001:db8::2", "fe80::1"],
+)
+def test_distinct_ipv6_gateway_is_valid(gateway):
+    config = desired(
+        [physical()],
+        [interface(ipv6={"mode": "static", "address": "2001:db8::1/64"})],
+        [{"id": "router", "interface": "lan", "address": gateway}],
+        [],
+    )
+    assert plan_network(config).files["10-kavernis-nic.network"]
+
+
+def test_ipv6_gateway_cannot_be_interface_address():
+    config = desired(
+        [physical()],
+        [interface(ipv6={"mode": "static", "address": "2001:db8::1/64"})],
+        [{"id": "router", "interface": "lan", "address": "2001:db8::1"}],
+        [],
+    )
+    with pytest.raises(ValueError, match="cannot be interface address"):
+        plan_network(config)
+
+
 @pytest.mark.parametrize("gateway", ["::", "ff02::1"])
 def test_onlink_does_not_bypass_invalid_ipv6_next_hop(gateway):
     config = desired(
