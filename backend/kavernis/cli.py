@@ -161,6 +161,16 @@ def _print_candidate(
         )
         print(f"Apply mode: {mode}")
         print("Reboot required: no")
+        if transition.has_structural_operations:
+            affected = sorted(
+                {
+                    operation.device_name
+                    for operation in transition.operations
+                    if operation.kind.value in {"detach", "delete", "create", "attach"}
+                }
+            )
+            print(f"Affected kernel interfaces: {', '.join(affected)}")
+            print("Connectivity impact: affected interfaces may interrupt traffic.")
         print()
     for index, (filename, content) in enumerate(sorted(candidate.files.items())):
         if index:

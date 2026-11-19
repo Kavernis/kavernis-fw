@@ -9,6 +9,7 @@ from kavernis.core.network_transition import (
     TransitionOperationKind,
     UnsupportedNetworkTransition,
     classify_transitions,
+    draft_transition,
     plan_transition,
     validate_transition,
 )
@@ -112,6 +113,110 @@ def test_unowned_virtual_name_collision_is_rejected():
         validate_transition(None, NetworkModel((NIC, VLAN), ()), OBSERVED)
 
 
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        RuntimeLink("foreign0", "vlan", "eth0", 99),
+        RuntimeLink("foreign0", "bridge", stp=True),
+        RuntimeLink("foreign0", "veth"),
+        RuntimeLink("foreign0"),
+    ],
+)
+def test_virtual_rename_cannot_claim_existing_foreign_link(foreign):
+    desired = NetworkModel(
+        (NIC, replace(VLAN, name="foreign0")),
+        (),
+    )
+    observed = NetworkRuntimeSnapshot((RuntimeLink("eth0"), OBSERVED.links[2], foreign))
+    with pytest.raises(UnsupportedNetworkTransition, match="ownership"):
+        plan_transition(NetworkModel((NIC, VLAN), ()), desired, observed)
+
+
+def test_swapped_virtual_names_are_rejected_before_native_mutation():
+    other = NetworkDevice("other", "vlan40", VLANSettings("nic", 40))
+    previous = NetworkModel((NIC, VLAN, other), ())
+    desired = NetworkModel(
+        (NIC, replace(VLAN, name="vlan40"), replace(other, name="vlan30")), ()
+    )
+    observed = NetworkRuntimeSnapshot(
+        (
+            RuntimeLink("eth0"),
+            RuntimeLink("vlan30", "vlan", "eth0", 30),
+            RuntimeLink("vlan40", "vlan", "eth0", 40),
+        )
+    )
+    with pytest.raises(UnsupportedNetworkTransition, match="ownership"):
+        plan_transition(previous, desired, observed)
+
+
+def test_virtual_rename_to_confirmed_absent_name_has_scoped_recreate_plan():
+    previous = NetworkModel((NIC, VLAN), ())
+    desired = NetworkModel((NIC, replace(VLAN, name="vlan40")), ())
+    observed = NetworkRuntimeSnapshot(
+        (RuntimeLink("eth0"), RuntimeLink("vlan30", "vlan", "eth0", 30))
+    )
+    plan = plan_transition(previous, desired, observed)
+    assert plan.recovery_delete_names == ("vlan30", "vlan40")
+    assert [operation.kind for operation in plan.operations][:2] == [
+        TransitionOperationKind.DELETE,
+        TransitionOperationKind.RELOAD,
+    ]
+
+
+def test_vlan_tag_reuse_deletes_only_the_retired_identity_before_creation():
+    previous = NetworkModel((NIC, VLAN), ())
+    replacement = NetworkDevice("replacement", "vlan100", VLANSettings("nic", 30))
+    desired = NetworkModel((NIC, replacement), ())
+    observed = NetworkRuntimeSnapshot(
+        (RuntimeLink("eth0"), RuntimeLink("vlan30", "vlan", "eth0", 30))
+    )
+    plan = plan_transition(previous, desired, observed)
+    deletes = [
+        operation.device_name
+        for operation in plan.operations
+        if operation.kind is TransitionOperationKind.DELETE
+    ]
+    creates = [
+        operation.device_name
+        for operation in plan.operations
+        if operation.kind is TransitionOperationKind.CREATE
+    ]
+    assert deletes == ["vlan30"]
+    assert creates == ["vlan100"]
+
+
+@pytest.mark.parametrize(
+    "previous, desired",
+    [
+        (
+            NetworkModel((NIC, VLAN), ()),
+            NetworkModel(
+                (NIC, NetworkDevice("vlan", "vlan30", PhysicalSettings())), ()
+            ),
+        ),
+        (
+            NetworkModel(
+                (NIC, NetworkDevice("virtual", "vlan40", VLANSettings("nic", 40))), ()
+            ),
+            NetworkModel(
+                (NIC, NetworkDevice("virtual", "vlan40", PhysicalSettings())), ()
+            ),
+        ),
+        (
+            NetworkModel(
+                (NIC, NetworkDevice("physical", "eth1", PhysicalSettings())), ()
+            ),
+            NetworkModel(
+                (NIC, NetworkDevice("physical", "eth1", VLANSettings("nic", 40))), ()
+            ),
+        ),
+    ],
+)
+def test_device_kind_changes_are_rejected(previous, desired):
+    with pytest.raises(UnsupportedNetworkTransition, match="cannot change kind"):
+        draft_transition(previous, desired)
+
+
 def test_recovery_cleanup_excludes_unaffected_managed_virtual_devices():
     unrelated = NetworkDevice("other-vlan", "vlan200", VLANSettings("nic", 200))
     previous = NetworkModel((NIC, VLAN, unrelated), ())
@@ -127,6 +232,39 @@ def test_recovery_cleanup_excludes_unaffected_managed_virtual_devices():
     )
     plan = plan_transition(previous, desired, observed)
     assert plan.recovery_delete_names == ("vlan30",)
+
+
+def test_bridge_membership_change_uses_targeted_attachment_not_recreation():
+    physical = NetworkDevice("port", "eth2", PhysicalSettings())
+    previous = NetworkModel(
+        (NIC, physical, NetworkDevice("bridge", "br0", BridgeSettings(("nic",)))), ()
+    )
+    desired = NetworkModel(
+        (
+            NIC,
+            physical,
+            NetworkDevice("bridge", "br0", BridgeSettings(("nic", "port"))),
+        ),
+        (),
+    )
+    observed = NetworkRuntimeSnapshot(
+        (
+            RuntimeLink("eth0", master="br0"),
+            RuntimeLink("eth2"),
+            RuntimeLink("br0", "bridge", stp=True),
+        )
+    )
+    plan = plan_transition(previous, desired, observed)
+    assert not any(
+        operation.kind is TransitionOperationKind.DELETE
+        and operation.device_id == "bridge"
+        for operation in plan.operations
+    )
+    assert any(
+        operation.kind is TransitionOperationKind.ATTACH
+        and operation.device_id == "port"
+        for operation in plan.operations
+    )
 
 
 def test_new_bridge_attachment_to_applied_unmastered_physical_is_supported():

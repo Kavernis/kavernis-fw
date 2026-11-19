@@ -406,6 +406,7 @@ class NetworkStateService:
         self.backend.activate(
             candidate,
             self.paths.networkd_path,
+            model=model,
             verify=verify,
             verify_recovery=verify_recovery,
             record=record,

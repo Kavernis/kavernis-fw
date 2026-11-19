@@ -26,12 +26,13 @@ Apply and rollback now follow these boundaries:
    topology before assuming a managed structural change is safe. Physical kernel
    devices are never deleted or recreated.
 4. Snapshot desired state, atomically replace individual managed artifacts and
-   fsync. For an affected virtual topology, load target artifacts with
-   `networkctl reload`, detach only planned bridge members, delete only planned
-   managed VLAN/bridge links with `ip link`, reload target artifacts, and issue
-   scoped `networkctl reconfigure` calls for target devices. This avoids a full
-   `systemd-networkd` restart and prevents an old on-disk netdev definition from
-   recreating a deleted device.
+   fsync. For an affected virtual topology, load target definitions with
+   `networkctl reload --no-reconfigure`, detach only planned bridge members,
+   delete only planned managed VLAN/bridge links with `ip link`, wait for each
+   deletion, create/wait for only the planned virtual identities, apply targeted
+   bridge attachments, then issue scoped `networkctl reconfigure` calls only
+   after the named link exists. This avoids a full `systemd-networkd` restart
+   and does not assume that a second unchanged reload recreates a deleted VLAN.
 5. Inspect actual Linux/networkd state with bounded polling. Only after the
    required checks pass, record success and artifact hashes in SQLite.
 
@@ -84,15 +85,21 @@ continuous runtime monitor.
 
 ## Supported and rejected transitions
 
-Supported with live structural lifecycle operations: initial VLAN/bridge
-creation, VLAN tag or parent change, virtual-device name/type replacement,
-VLAN/bridge removal, bridge member addition/removal, bridge STP changes, and a
-VLAN attached to a bridge. The planner destroys dependants before dependencies:
-it detaches old bridge members, deletes an affected bridge, deletes affected
-VLANs, reloads target artifacts, then reconfigures target virtual devices and
-attachments. Static address/route changes and DHCPv4/DHCPv6/SLAAC intent retain
-their normal reload path. All supported transitions still have to pass exact
-runtime topology and required-static-L3 verification before success is recorded.
+Implemented structural lifecycle operations cover initial VLAN/bridge creation,
+VLAN tag or parent change, virtual-device rename, VLAN/bridge removal, bridge
+member addition/removal, bridge STP changes, and a VLAN attached to a bridge.
+Virtual-to-physical, physical-to-virtual, and all other device-kind changes are
+rejected. A bridge membership-only change uses scoped member detach/attach and
+does not recreate the bridge. The planner destroys dependants before dependencies
+only when a bridge netdev itself must be recreated. Static address/route changes
+and DHCPv4/DHCPv6/SLAAC intent retain their normal reload path. All supported
+transitions still have to pass exact runtime topology and required-static-L3
+verification before success is recorded.
+
+This implementation is unit-tested but is **not yet real-VM-validated** for
+systemd 257. In particular, exact netdev creation timing, stacked VLAN behavior,
+and bridge reconfiguration remain fail-closed pending the disposable Debian 13
+test scenarios below. A subprocess exit status alone is never convergence proof.
 
 Deleting a bridge detaches but never deletes its physical members. Changing a
 VLAN parent or tag affects only that VLAN identity; unrelated managed VLANs are
@@ -119,11 +126,12 @@ kernel cleanup. Rollback uses the same checks **before replacing live YAML**.
 The backend's narrow `BaseException` boundary begins at persistent native
 mutation and includes reload, structural lifecycle operations, verification and
 state recording. On a catchable failure, including `KeyboardInterrupt` and
-`SystemExit`, it restores the exact prior artifact bytes, removes only virtual
-identities belonging to the failed transition (bridges before dependent VLANs),
-reloads networkd so the previous topology is recreated, and verifies the prior
-static model. The original cancellation is re-raised. Recovery failure is
-attached to that exception and printed by the CLI; secondary outcome-recording
+`SystemExit`, it restores the exact prior artifact bytes, removes only identities
+which this invocation actually created or deleted, reloads networkd so the
+previous topology is reconstructed, and verifies the prior static model. Cleanup
+failure is reported separately but does not prevent the remaining safe reload and
+verification attempt. The original cancellation is re-raised. Recovery failure
+is attached to that exception and printed by the CLI; secondary outcome-recording
 failures do not hide the cause.
 
 File restoration and successful recovery reload are reported separately from

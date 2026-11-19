@@ -85,6 +85,11 @@ def test_physical_device_name_length_boundaries():
         desired([physical(name="e" * 16)])
 
 
+def test_leading_dash_device_names_are_rejected_before_native_commands():
+    with pytest.raises(ValidationError, match="name"):
+        desired([physical(name="-eth0")])
+
+
 def test_domain_callers_also_receive_duplicate_validation():
     resolved = model(desired([physical()], [interface()]))
     with pytest.raises(ValueError, match="duplicate device id"):

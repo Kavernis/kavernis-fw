@@ -134,9 +134,12 @@ SQLite; the CLI's status categories remain the existing four categories.
 
 `SystemdNetworkdBackend` is the Debian 13/systemd 257 production activation
 boundary. `networkctl reload` alone is insufficient: for planned VLAN/bridge
-changes it coordinates scoped detachment/deletion, target reload and targeted
-reconfigure operations. The backend observes Linux and networkd through a typed
-runtime inspector and core requires static verification before success recording.
+changes it loads target definitions without broad reconfiguration, coordinates
+scoped detachment/deletion and explicit virtual-device creation, waits for link
+state transitions, then reconfigures only existing affected links. The backend
+observes Linux and networkd through a typed runtime inspector and core requires
+static verification before success recording. This sequence is unit-tested but
+still requires the gated Debian 13 VM suite for native validation.
 Dynamic acquisition, reachability and continued management connectivity are not
 verified. Physical device recreation, ambiguous ownership and watchdog recovery
 remain unsupported and fail closed.

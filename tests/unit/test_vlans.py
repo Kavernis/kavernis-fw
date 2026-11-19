@@ -100,7 +100,9 @@ def test_reject_invalid_parent(parent, error):
         plan_network(desired(data))
 
 
-@pytest.mark.parametrize("name", ["x" * 16, ".", "..", "eth1:20", "eth1\nKind=bridge"])
+@pytest.mark.parametrize(
+    "name", ["x" * 16, ".", "..", "-vlan20", "eth1:20", "eth1\nKind=bridge"]
+)
 def test_reject_invalid_vlan_device_name(name):
     data = devices()
     data[1]["name"] = name

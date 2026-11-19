@@ -66,6 +66,8 @@ def test_plan_prints_structural_lifecycle_operations(capsys) -> None:
     assert "DELETE vlan (vlan100)" in output
     assert "LIVE STRUCTURAL RECONFIGURATION" in output
     assert "Reboot required: no" in output
+    assert "Affected kernel interfaces: vlan100" in output
+    assert "may interrupt traffic" in output
 
 
 def test_apply_network_uses_one_network_transaction(

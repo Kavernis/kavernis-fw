@@ -5,8 +5,9 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from ipaddress import ip_address, ip_interface, ip_network
 from math import isfinite
 from pathlib import Path
@@ -17,7 +18,7 @@ from kavernis.core.network_transition import (
     NetworkTransitionPlan,
     TransitionOperationKind,
 )
-from kavernis.models.device import BridgeSettings, VLANSettings
+from kavernis.models.device import BridgeSettings, NetworkDevice, VLANSettings
 from kavernis.models.interface import (
     InterfaceAddressing,
     IPv4AddressMode,
@@ -55,35 +56,118 @@ class NativeNetworkdOperations:
     def __init__(self, timeout: float) -> None:
         self.timeout = timeout
 
-    def reload(self, *, check: bool) -> subprocess.CompletedProcess[str]:
+    def reload(
+        self, *, check: bool, reconfigure: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = ["networkctl", "reload"]
+        if not reconfigure:
+            arguments.append("--no-reconfigure")
         return subprocess.run(
-            ["networkctl", "reload"],
+            arguments,
             check=check,
             capture_output=True,
             text=True,
             timeout=self.timeout,
         )
 
-    def execute_lifecycle(self, plan: NetworkTransitionPlan) -> None:
+    def execute_lifecycle(
+        self,
+        plan: NetworkTransitionPlan,
+        model: NetworkModel,
+        progress: "NativeLifecycleProgress",
+    ) -> None:
         for operation in plan.operations:
             if operation.kind is TransitionOperationKind.DETACH:
                 self._ip(["link", "set", "dev", operation.device_name, "nomaster"])
             elif operation.kind is TransitionOperationKind.DELETE:
                 self._ip(["link", "delete", "dev", operation.device_name])
+                progress.deleted_names.add(operation.device_name)
+                self.wait_for_link(operation.device_name, present=False)
 
-    def reconfigure_target(self, plan: NetworkTransitionPlan) -> None:
-        names = sorted(
-            {
-                operation.device_name
-                for operation in plan.operations
-                if operation.kind
-                in (
-                    TransitionOperationKind.CREATE,
-                    TransitionOperationKind.ATTACH,
+        devices = {device.id: device for device in model.devices}
+        for operation in plan.operations:
+            if operation.kind is not TransitionOperationKind.CREATE:
+                continue
+            device = devices[operation.device_id]
+            # A config-only reload may already have created a previously absent
+            # target netdev. It is usable for this candidate, but it was not
+            # created by this invocation's explicit netlink action. Do not add
+            # it to automatic recovery cleanup: a concurrent foreign creator
+            # must never be deleted merely because it has a desired name.
+            if self.link_exists(device.name):
+                continue
+            if isinstance(device.settings, VLANSettings):
+                parent = devices[device.settings.parent]
+                self._ip(
+                    [
+                        "link",
+                        "add",
+                        "link",
+                        parent.name,
+                        "name",
+                        device.name,
+                        "type",
+                        "vlan",
+                        "id",
+                        str(device.settings.tag),
+                    ]
                 )
-            }
-        )
-        for name in names:
+            elif isinstance(device.settings, BridgeSettings):
+                self._ip(
+                    [
+                        "link",
+                        "add",
+                        "name",
+                        device.name,
+                        "type",
+                        "bridge",
+                        "stp_state",
+                        "1" if device.settings.stp else "0",
+                    ]
+                )
+            else:  # Defensive: transition planning must never create physical links.
+                raise NetworkdApplyError(
+                    f"cannot create physical device {device.name} through networkd"
+                )
+            progress.created_names.add(device.name)
+            self.wait_for_link(device.name, present=True)
+
+        for operation in plan.operations:
+            if operation.kind is not TransitionOperationKind.ATTACH:
+                continue
+            bridge = _bridge_for_member(model, operation.device_id)
+            if bridge is None:
+                raise NetworkdApplyError(
+                    f"no target bridge owns member {operation.device_name}"
+                )
+            self.wait_for_link(operation.device_name, present=True)
+            self.wait_for_link(bridge.name, present=True)
+            self._ip(
+                ["link", "set", "dev", operation.device_name, "master", bridge.name]
+            )
+
+    def reconfigure_target(
+        self, plan: NetworkTransitionPlan, model: NetworkModel
+    ) -> None:
+        devices = {device.id: device for device in model.devices}
+        names: set[str] = set()
+        for operation in plan.operations:
+            if operation.kind is TransitionOperationKind.CREATE:
+                names.add(operation.device_name)
+                device = devices[operation.device_id]
+                if isinstance(device.settings, VLANSettings):
+                    names.add(devices[device.settings.parent].name)
+            elif (
+                operation.kind
+                in (
+                    TransitionOperationKind.ATTACH,
+                    TransitionOperationKind.DETACH,
+                )
+                and operation.device_id in devices
+            ):
+                names.add(operation.device_name)
+        for name in sorted(names):
+            self.wait_for_link(name, present=True)
             subprocess.run(
                 ["networkctl", "reconfigure", name],
                 check=True,
@@ -92,8 +176,9 @@ class NativeNetworkdOperations:
                 timeout=self.timeout,
             )
 
-    def remove_recovery_identities(self, plan: NetworkTransitionPlan) -> None:
-        for name in plan.recovery_delete_names:
+    def remove_recovery_identities(self, names: set[str]) -> None:
+        failures: list[str] = []
+        for name in sorted(names):
             result = subprocess.run(
                 ["ip", "link", "delete", "dev", name],
                 check=False,
@@ -102,10 +187,45 @@ class NativeNetworkdOperations:
                 timeout=self.timeout,
             )
             if result.returncode and not _missing_link(result.stderr):
+                failures.append(f"{name}: {result.stderr.strip() or result.returncode}")
+        if failures:
+            raise NetworkdApplyError(
+                "cannot remove managed virtual device(s) during recovery: "
+                + "; ".join(failures)
+            )
+
+    def wait_for_link(self, name: str, *, present: bool) -> None:
+        deadline = time.monotonic() + self.timeout
+        last_error = "no observation"
+        while True:
+            exists = self.link_exists(
+                name, timeout=max(0.1, min(self.timeout, deadline - time.monotonic()))
+            )
+            if exists == present:
+                return
+            last_error = "link exists" if exists else "link is absent"
+            if time.monotonic() >= deadline:
+                state = "appear" if present else "disappear"
                 raise NetworkdApplyError(
-                    f"cannot remove managed virtual device {name} during recovery: "
-                    f"{result.stderr.strip() or result.returncode}"
+                    f"timed out waiting for {name} to {state}: {last_error}"
                 )
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+    def link_exists(self, name: str, *, timeout: float | None = None) -> bool:
+        result = subprocess.run(
+            ["ip", "-j", "-d", "link", "show", "dev", name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout if timeout is None else timeout,
+        )
+        if result.returncode == 0:
+            return True
+        if _missing_link(result.stderr):
+            return False
+        raise NetworkdApplyError(
+            f"cannot inspect link {name}: {result.stderr.strip() or result.returncode}"
+        )
 
     def _ip(self, arguments: list[str]) -> None:
         subprocess.run(
@@ -119,6 +239,30 @@ class NativeNetworkdOperations:
 
 def _missing_link(stderr: str) -> bool:
     return "Cannot find device" in stderr or "does not exist" in stderr
+
+
+@dataclass
+class NativeLifecycleProgress:
+    """Facts established by this invocation, used to scope recovery cleanup."""
+
+    deleted_names: set[str] = field(default_factory=set)
+    created_names: set[str] = field(default_factory=set)
+
+    @property
+    def recovery_cleanup_names(self) -> set[str]:
+        return self.deleted_names | self.created_names
+
+
+def _bridge_for_member(model: NetworkModel, member_id: str) -> NetworkDevice | None:
+    return next(
+        (
+            device
+            for device in model.devices
+            if isinstance(device.settings, BridgeSettings)
+            and member_id in device.settings.members
+        ),
+        None,
+    )
 
 
 @dataclass(frozen=True)
@@ -147,6 +291,7 @@ class NetworkBackend(Protocol):
         candidate: NetworkdConfiguration,
         directory: Path,
         *,
+        model: NetworkModel,
         verify: Callable[[], None] | None,
         verify_recovery: Callable[[], None] | None,
         record: Callable[[], None] | None,
@@ -188,6 +333,7 @@ class SystemdNetworkdBackend:
         candidate: NetworkdConfiguration,
         directory: Path,
         *,
+        model: NetworkModel,
         verify: Callable[[], None] | None,
         verify_recovery: Callable[[], None] | None,
         record: Callable[[], None] | None,
@@ -199,6 +345,7 @@ class SystemdNetworkdBackend:
         activation(
             candidate,
             directory,
+            model=model,
             verify=verify,
             verify_recovery=verify_recovery,
             record=record,
@@ -359,6 +506,7 @@ def apply(
     candidate: NetworkdConfiguration,
     directory: Path = Path("/etc/systemd/network"),
     *,
+    model: NetworkModel | None = None,
     verify: Callable[[], None] | None = None,
     verify_recovery: Callable[[], None] | None = None,
     record: Callable[[], None] | None = None,
@@ -383,6 +531,7 @@ def apply(
         raise
     phase = "artifact mutation"
     operations = NativeNetworkdOperations(reload_timeout)
+    lifecycle = NativeLifecycleProgress()
     try:
         directory.mkdir(parents=True, exist_ok=True)
         for filename, content in candidate.files.items():
@@ -390,14 +539,23 @@ def apply(
         for filename in sorted(set(previous) - set(candidate.files)):
             (directory / filename).unlink()
         _sync_directory(directory)
-        phase = "native reload"
-        operations.reload(check=True)
-        if transition_plan is not None and transition_plan.requires_lifecycle:
+        if transition_plan is not None and transition_plan.has_structural_operations:
+            if model is None:
+                raise ValueError(
+                    "structural network transition requires a target model"
+                )
+            phase = "load target networkd configuration"
+            # systemd 257 does not apply immutable netdev changes to an existing
+            # link. Load the candidate without broad L3 reconfiguration, then
+            # perform exact scoped lifecycle actions below.
+            operations.reload(check=True, reconfigure=False)
             phase = "native device lifecycle"
-            operations.execute_lifecycle(transition_plan)
-            phase = "native recreation"
+            operations.execute_lifecycle(transition_plan, model, lifecycle)
+            phase = "target interface reconfiguration"
+            operations.reconfigure_target(transition_plan, model)
+        else:
+            phase = "native reload"
             operations.reload(check=True)
-            operations.reconfigure_target(transition_plan)
         phase = "runtime verification"
         if verify is not None:
             verify()
@@ -424,7 +582,7 @@ def apply(
             previous,
             verify_recovery,
             operations,
-            transition_plan,
+            lifecycle,
         )
         detail = f"apply failed during {phase}: {error}; {recovery}"
         if isinstance(error, subprocess.CalledProcessError):
@@ -440,34 +598,41 @@ def _recover(
     previous: Mapping[str, bytes],
     verify: Callable[[], None] | None,
     operations: NativeNetworkdOperations,
-    transition_plan: NetworkTransitionPlan | None,
+    lifecycle: NativeLifecycleProgress,
 ) -> str:
     """Best effort cleanup, reporting each boundary without losing the cause."""
     try:
         _restore(directory, previous)
     except BaseException as error:
         return f"artifact recovery failed: {type(error).__name__}: {error}"
+    details = ["previous files restored"]
+    if lifecycle.recovery_cleanup_names:
+        try:
+            operations.remove_recovery_identities(lifecycle.recovery_cleanup_names)
+            details.append("scoped virtual cleanup completed")
+        except BaseException as error:
+            details.append(f"scoped virtual cleanup failed: {error}")
     try:
-        if transition_plan is not None and transition_plan.recovery_delete_names:
-            operations.remove_recovery_identities(transition_plan)
         recovery = operations.reload(check=False)
         if recovery.returncode:
-            return (
-                "previous files restored but recovery reload failed: "
+            details.append(
+                "recovery reload failed: "
                 f"{recovery.stderr.strip() or recovery.returncode}"
             )
+            return "; ".join(details)
+        details.append("previous configuration reloaded")
     except BaseException as error:
-        return f"previous files restored but recovery reload failed: {error}"
+        details.append(f"recovery reload failed: {error}")
+        return "; ".join(details)
     if verify is None:
-        return "previous files restored and reloaded; runtime restoration unverified"
+        return "; ".join([*details, "runtime restoration unverified"])
     try:
         verify()
     except BaseException as error:
-        return (
-            "previous files restored and reloaded; runtime recovery failed: "
-            f"{type(error).__name__}: {error}"
+        return "; ".join(
+            [*details, f"runtime recovery failed: {type(error).__name__}: {error}"]
         )
-    return "previous files restored; required static runtime restoration verified"
+    return "; ".join([*details, "required static runtime restoration verified"])
 
 
 def artifact_hashes(candidate: NetworkdConfiguration) -> dict[str, str]:

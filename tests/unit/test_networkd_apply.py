@@ -15,6 +15,13 @@ from kavernis.core.network_transition import (
     TransitionOperation,
     TransitionOperationKind,
 )
+from kavernis.models.device import (
+    BridgeSettings,
+    NetworkDevice,
+    PhysicalSettings,
+    VLANSettings,
+)
+from kavernis.models.network import NetworkModel
 
 
 def test_reject_unsafe_generated_candidate() -> None:
@@ -289,9 +296,19 @@ def test_structural_lifecycle_uses_scoped_netlink_commands_in_order(
     from kavernis.backends import networkd
 
     calls = []
+    links = {"eth0", "vlan100"}
 
     def run(arguments, **kwargs):
         calls.append(arguments)
+        if arguments[:5] == ["ip", "-j", "-d", "link", "show"]:
+            name = arguments[-1]
+            return subprocess.CompletedProcess(
+                arguments, 0 if name in links else 1, "", "Cannot find device"
+            )
+        if arguments[:3] == ["ip", "link", "delete"]:
+            links.remove(arguments[-1])
+        if arguments[:3] == ["ip", "link", "add"]:
+            links.add(arguments[arguments.index("name") + 1])
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(networkd.subprocess, "run", run)
@@ -333,12 +350,37 @@ def test_structural_lifecycle_uses_scoped_netlink_commands_in_order(
         ),
         tmp_path,
         transition_plan=plan,
+        model=NetworkModel(
+            (
+                NetworkDevice("parent", "eth0", PhysicalSettings()),
+                NetworkDevice("vlan", "vlan100", VLANSettings("parent", 100)),
+            ),
+            (),
+        ),
     )
     assert calls == [
-        ["networkctl", "reload"],
+        ["networkctl", "reload", "--no-reconfigure"],
         ["ip", "link", "set", "dev", "vlan100", "nomaster"],
         ["ip", "link", "delete", "dev", "vlan100"],
-        ["networkctl", "reload"],
+        ["ip", "-j", "-d", "link", "show", "dev", "vlan100"],
+        ["ip", "-j", "-d", "link", "show", "dev", "vlan100"],
+        [
+            "ip",
+            "link",
+            "add",
+            "link",
+            "eth0",
+            "name",
+            "vlan100",
+            "type",
+            "vlan",
+            "id",
+            "100",
+        ],
+        ["ip", "-j", "-d", "link", "show", "dev", "vlan100"],
+        ["ip", "-j", "-d", "link", "show", "dev", "eth0"],
+        ["networkctl", "reconfigure", "eth0"],
+        ["ip", "-j", "-d", "link", "show", "dev", "vlan100"],
         ["networkctl", "reconfigure", "vlan100"],
     ]
 
@@ -349,9 +391,17 @@ def test_structural_recovery_removes_only_plan_owned_virtual_identities(
     from kavernis.backends import networkd
 
     calls = []
+    links = {"old0"}
 
     def run(arguments, **kwargs):
         calls.append(arguments)
+        if arguments[:5] == ["ip", "-j", "-d", "link", "show"]:
+            name = arguments[-1]
+            return subprocess.CompletedProcess(
+                arguments, 0 if name in links else 1, "", "Cannot find device"
+            )
+        if arguments[:3] == ["ip", "link", "delete"]:
+            links.discard(arguments[-1])
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(networkd.subprocess, "run", run)
@@ -379,9 +429,174 @@ def test_structural_recovery_removes_only_plan_owned_virtual_identities(
             ),
             tmp_path,
             transition_plan=plan,
+            model=NetworkModel(
+                (NetworkDevice("parent", "eth0", PhysicalSettings()),), ()
+            ),
             verify=lambda: (_ for _ in ()).throw(RuntimeError("verification failed")),
         )
     assert ["ip", "link", "delete", "dev", "old0"] in calls
-    assert ["ip", "link", "delete", "dev", "new0"] in calls
+    assert ["ip", "link", "delete", "dev", "new0"] not in calls
     assert (tmp_path / "10-kavernis-old.network").exists()
     assert not (tmp_path / "10-kavernis-new.network").exists()
+
+
+def test_recovery_continues_to_reload_when_scoped_cleanup_fails(tmp_path, monkeypatch):
+    from kavernis.backends import networkd
+
+    calls = []
+    links = {"old0"}
+    deletions = 0
+
+    def run(arguments, **kwargs):
+        nonlocal deletions
+        calls.append(arguments)
+        if arguments[:5] == ["ip", "-j", "-d", "link", "show"]:
+            name = arguments[-1]
+            return subprocess.CompletedProcess(
+                arguments, 0 if name in links else 1, "", "Cannot find device"
+            )
+        if arguments[:3] == ["ip", "link", "delete"]:
+            deletions += 1
+            if deletions == 1:
+                links.discard(arguments[-1])
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            return subprocess.CompletedProcess(arguments, 1, "", "permission denied")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(networkd.subprocess, "run", run)
+    plan = NetworkTransitionPlan(
+        (),
+        (
+            TransitionOperation(
+                TransitionOperationKind.DELETE,
+                "old",
+                "old0",
+                "remove old VLAN",
+            ),
+        ),
+        ("old0",),
+        (),
+        ("old0",),
+    )
+    with pytest.raises(RuntimeError, match="candidate verification failed") as caught:
+        networkd.apply(
+            NetworkdConfiguration(
+                {"10-kavernis-new.network": "[Match]\nName=eth0\n\n[Network]\n"}
+            ),
+            tmp_path,
+            transition_plan=plan,
+            model=NetworkModel(
+                (NetworkDevice("parent", "eth0", PhysicalSettings()),), ()
+            ),
+            verify=lambda: (_ for _ in ()).throw(
+                RuntimeError("candidate verification failed")
+            ),
+        )
+    notes = " ".join(caught.value.__notes__)
+    assert "scoped virtual cleanup failed" in notes
+    assert "previous configuration reloaded" in notes
+    assert calls[-1] == ["networkctl", "reload"]
+
+
+def test_attachment_failure_does_not_delete_previously_applied_devices(
+    tmp_path, monkeypatch
+):
+    from kavernis.backends import networkd
+
+    calls = []
+
+    def run(arguments, **kwargs):
+        calls.append(arguments)
+        if arguments[:5] == ["ip", "-j", "-d", "link", "show"]:
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(networkd.subprocess, "run", run)
+    plan = NetworkTransitionPlan(
+        (),
+        (
+            TransitionOperation(
+                TransitionOperationKind.ATTACH,
+                "member",
+                "eth1",
+                "attach to existing bridge",
+            ),
+        ),
+        ("br0",),
+        ("br0",),
+        (),
+    )
+    model = NetworkModel(
+        (
+            NetworkDevice("parent", "eth0", PhysicalSettings()),
+            NetworkDevice("member", "eth1", PhysicalSettings()),
+            NetworkDevice("bridge", "br0", BridgeSettings(("member",))),
+        ),
+        (),
+    )
+    with pytest.raises(RuntimeError, match="verification failed"):
+        networkd.apply(
+            NetworkdConfiguration(
+                {"10-kavernis-bridge.network": "[Match]\nName=br0\n\n[Network]\n"}
+            ),
+            tmp_path,
+            transition_plan=plan,
+            model=model,
+            verify=lambda: (_ for _ in ()).throw(RuntimeError("verification failed")),
+        )
+    assert not any(command[:3] == ["ip", "link", "delete"] for command in calls)
+
+
+def test_recovery_never_deletes_a_candidate_that_appeared_without_our_creation(
+    tmp_path, monkeypatch
+):
+    from kavernis.backends import networkd
+
+    calls = []
+
+    def run(arguments, **kwargs):
+        calls.append(arguments)
+        if arguments[:5] == ["ip", "-j", "-d", "link", "show"]:
+            # Simulate an identity that appeared between planning and explicit
+            # creation. Recovery must treat it as unproven ownership.
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(networkd.subprocess, "run", run)
+    plan = NetworkTransitionPlan(
+        (),
+        (
+            TransitionOperation(
+                TransitionOperationKind.CREATE,
+                "candidate",
+                "candidate0",
+                "create candidate VLAN",
+            ),
+        ),
+        (),
+        ("candidate0",),
+        ("candidate0",),
+    )
+    with pytest.raises(RuntimeError, match="verification failed"):
+        networkd.apply(
+            NetworkdConfiguration(
+                {
+                    "10-kavernis-candidate.network": (
+                        "[Match]\nName=candidate0\n\n[Network]\n"
+                    )
+                }
+            ),
+            tmp_path,
+            transition_plan=plan,
+            model=NetworkModel(
+                (
+                    NetworkDevice("parent", "eth0", PhysicalSettings()),
+                    NetworkDevice(
+                        "candidate", "candidate0", VLANSettings("parent", 10)
+                    ),
+                ),
+                (),
+            ),
+            verify=lambda: (_ for _ in ()).throw(RuntimeError("verification failed")),
+        )
+    assert ["ip", "link", "delete", "dev", "candidate0"] not in calls

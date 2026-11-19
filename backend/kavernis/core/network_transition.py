@@ -5,7 +5,7 @@ identities and dependencies. The systemd-networkd backend owns the native
 `ip` and `networkctl` operations used to implement it.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from kavernis.backends.network_runtime import NetworkRuntimeSnapshot, topology_issues
@@ -114,7 +114,7 @@ def plan_transition(
     observed: NetworkRuntimeSnapshot,
 ) -> NetworkTransitionPlan:
     """Validate ownership and produce safe, dependency-ordered live operations."""
-    plan = draft_transition(previous, desired)
+    draft = draft_transition(previous, desired)
     old = {device.id: device for device in previous.devices} if previous else {}
     new = {device.id: device for device in desired.devices}
 
@@ -127,6 +127,11 @@ def plan_transition(
             )
 
     links = {link.name: link for link in observed.links}
+    previous_virtual_by_name = {
+        device.name: device
+        for device in old.values()
+        if not isinstance(device.settings, PhysicalSettings)
+    }
     for identifier in sorted(old.keys() | new.keys()):
         before, after = old.get(identifier), new.get(identifier)
         if before is None and after is not None:
@@ -146,8 +151,23 @@ def plan_transition(
                     f"new virtual device {after.name} already exists without an "
                     "applied identity; ownership cannot be established"
                 )
+        elif (
+            before is not None
+            and after is not None
+            and not isinstance(after.settings, PhysicalSettings)
+        ):
+            link = links.get(after.name)
+            established = previous_virtual_by_name.get(after.name)
+            if link is not None and established is not before:
+                raise UnsupportedNetworkTransition(
+                    f"candidate virtual device {after.name} conflicts with an "
+                    "existing link whose ownership cannot be established"
+                )
 
-    return plan
+    # Apply reaches this point only after every candidate identity was checked
+    # against the pre-mutation snapshot. Recovery may therefore clean up only
+    # names that were either applied identities or confirmed absent candidates.
+    return replace(draft, recovery_virtual_names=_recovery_names(old, new))
 
 
 def draft_transition(
@@ -166,6 +186,11 @@ def draft_transition(
 
     for identifier in sorted(old.keys() | new.keys()):
         before, after = old.get(identifier), new.get(identifier)
+        if before is not None and after is not None and before.kind is not after.kind:
+            raise UnsupportedNetworkTransition(
+                f"device '{identifier}' cannot change kind from "
+                f"{before.kind.value} to {after.kind.value}"
+            )
         if before is not None and isinstance(before.settings, PhysicalSettings):
             if after is None or after != before:
                 raise UnsupportedNetworkTransition(
@@ -187,40 +212,12 @@ def draft_transition(
             if not isinstance(device.settings, PhysicalSettings)
         )
     )
-    recovery_devices = {
-        ("previous", identifier): device
-        for identifier, device in old.items()
-        if not isinstance(device.settings, PhysicalSettings)
-        and (identifier not in new or new[identifier] != device)
-    }
-    recovery_devices.update(
-        {
-            ("candidate", identifier): device
-            for identifier, device in new.items()
-            if not isinstance(device.settings, PhysicalSettings)
-            and (identifier not in old or old[identifier] != device)
-        }
-    )
-    # Remove bridges first. This releases their physical/VLAN members before a
-    # dependent VLAN is deleted and lets networkd reconstruct the old graph.
-    recovery_virtual_names = tuple(
-        dict.fromkeys(
-            device.name
-            for _, device in sorted(
-                recovery_devices.items(),
-                key=lambda item: (
-                    not isinstance(item[1].settings, BridgeSettings),
-                    item[1].name,
-                ),
-            )
-        )
-    )
     return NetworkTransitionPlan(
         transitions,
         tuple(operations),
         previous_virtual_names,
         candidate_virtual_names,
-        recovery_virtual_names,
+        (),
     )
 
 
@@ -242,7 +239,11 @@ def _structural_operations(
         identifier
         for identifier, device in old.items()
         if isinstance(device.settings, BridgeSettings)
-        and (identifier not in new or new[identifier] != device)
+        and (
+            identifier not in new
+            or not isinstance(new[identifier].settings, BridgeSettings)
+            or _requires_bridge_recreation(device, new[identifier])
+        )
     }
     detached: set[str] = set()
 
@@ -269,6 +270,43 @@ def _structural_operations(
                 "delete managed bridge before recreation/removal",
             )
         )
+
+    # Bridge membership is a .network association, not a bridge-netdev
+    # identity change. Apply only the changed attachments when STP/name/kind
+    # stayed stable; recreating the bridge would interrupt every member.
+    for identifier, bridge in sorted(old.items()):
+        candidate = new.get(identifier)
+        if (
+            candidate is None
+            or not isinstance(bridge.settings, BridgeSettings)
+            or not isinstance(candidate.settings, BridgeSettings)
+            or identifier in affected_bridges
+        ):
+            continue
+        assert isinstance(candidate.settings, BridgeSettings)
+        old_members = set(bridge.settings.members)
+        new_members = set(candidate.settings.members)
+        for member_id in sorted(old_members - new_members):
+            member = old[member_id]
+            operations.append(
+                TransitionOperation(
+                    TransitionOperationKind.DETACH,
+                    member_id,
+                    member.name,
+                    f"detach from bridge {bridge.name}",
+                )
+            )
+            detached.add(member_id)
+        for member_id in sorted(new_members - old_members):
+            member = new[member_id]
+            operations.append(
+                TransitionOperation(
+                    TransitionOperationKind.ATTACH,
+                    member_id,
+                    member.name,
+                    f"attach to existing bridge {bridge.name}",
+                )
+            )
 
     affected_vlans = {
         identifier
@@ -323,7 +361,7 @@ def _structural_operations(
         if not isinstance(bridge.settings, BridgeSettings):
             continue
         before = old.get(identifier)
-        if before is None or before != bridge:
+        if before is None or identifier in affected_bridges:
             for member_id in bridge.settings.members:
                 member = new[member_id]
                 operations.append(
@@ -360,4 +398,45 @@ def _bridge_owner(
             and member_id in device.settings.members
         ),
         None,
+    )
+
+
+def _requires_bridge_recreation(
+    previous: NetworkDevice, candidate: NetworkDevice
+) -> bool:
+    """Only immutable netdev properties justify rebuilding a bridge."""
+    assert isinstance(previous.settings, BridgeSettings)
+    assert isinstance(candidate.settings, BridgeSettings)
+    return (
+        previous.name != candidate.name
+        or previous.settings.stp != candidate.settings.stp
+    )
+
+
+def _recovery_names(
+    old: dict[str, NetworkDevice], new: dict[str, NetworkDevice]
+) -> tuple[str, ...]:
+    """Return confirmed affected virtual identities, bridge-first for cleanup."""
+    affected = [
+        device
+        for identifier, device in old.items()
+        if not isinstance(device.settings, PhysicalSettings)
+        and (identifier not in new or new[identifier] != device)
+    ] + [
+        device
+        for identifier, device in new.items()
+        if not isinstance(device.settings, PhysicalSettings)
+        and (identifier not in old or old[identifier] != device)
+    ]
+    return tuple(
+        dict.fromkeys(
+            device.name
+            for device in sorted(
+                affected,
+                key=lambda item: (
+                    not isinstance(item.settings, BridgeSettings),
+                    item.name,
+                ),
+            )
+        )
     )

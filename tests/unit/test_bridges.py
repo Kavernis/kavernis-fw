@@ -125,7 +125,9 @@ def test_bridge_member_cannot_have_l3_assignment_even_if_disabled(families):
         plan_network(desired(devices(), [interface(device="port-one", **families)]))
 
 
-@pytest.mark.parametrize("name", ["x" * 16, ".", "..", "br:0", "br0\nKind=vlan"])
+@pytest.mark.parametrize(
+    "name", ["x" * 16, ".", "..", "-br0", "br:0", "br0\nKind=vlan"]
+)
 def test_reject_invalid_bridge_device(name):
     data = devices()
     data[2]["name"] = name

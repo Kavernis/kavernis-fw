@@ -150,28 +150,26 @@ def test_apply_update_rollback_and_structural_reconfiguration_in_disposable_vm(
         state.apply()
         state.rollback(first)
 
-        # Failure after destructive deletion but before the backend's second
-        # target reload must reconstruct the former topology and retain receipt.
+        # Failure after native deletion/recreation but before reconfiguration
+        # must reconstruct the former topology and retain the old receipt.
         previous_applied = state.store.get_domain_state("network")
         assert previous_applied is not None
         devices["devices"][3]["vlan"]["tag"] = 40
         state.paths.devices_path.write_text(yaml.safe_dump(devices))
-        original_reload = networkd.NativeNetworkdOperations.reload
-        checked_reloads = 0
+        original_lifecycle = networkd.NativeNetworkdOperations.execute_lifecycle
 
-        def fail_before_recreation(self, *, check):
-            nonlocal checked_reloads
-            if check:
-                checked_reloads += 1
-                if checked_reloads == 2:
-                    raise RuntimeError("injected failure before target reload")
-            return original_reload(self, check=check)
+        def fail_after_lifecycle(self, plan, model, progress):
+            original_lifecycle(self, plan, model, progress)
+            assert progress.deleted_names == {"kv-test-vlan"}
+            raise RuntimeError("injected failure after native lifecycle")
 
         with monkeypatch.context() as context:
             context.setattr(
-                networkd.NativeNetworkdOperations, "reload", fail_before_recreation
+                networkd.NativeNetworkdOperations,
+                "execute_lifecycle",
+                fail_after_lifecycle,
             )
-            with pytest.raises(RuntimeError, match="before target reload"):
+            with pytest.raises(RuntimeError, match="after native lifecycle"):
                 state.apply()
         observed = {link.name: link for link in state.inspector.inspect(10).links}
         assert observed["kv-test-vlan"].vlan_id == 30
@@ -250,6 +248,8 @@ def test_apply_update_rollback_and_structural_reconfiguration_in_disposable_vm(
             if candidate
             else {
                 "10-kavernis-test-nic.network",
+                "10-kavernis-test-nic-two.network",
+                "10-kavernis-test-nic-three.network",
                 "10-kavernis-test-vlan.network",
                 "10-kavernis-test-vlan.netdev",
                 "10-kavernis-test-unrelated.network",

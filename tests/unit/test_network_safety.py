@@ -21,10 +21,23 @@ from network_helpers import service, write_desired
 def native(monkeypatch):
     original = subprocess.run
     calls = []
+    links = {"eth1", "enp1s0"}
 
     def run(args, **kwargs):
         if args[0] == "networkctl":
             calls.append(args)
+            return subprocess.CompletedProcess(args, 0)
+        if args[0] == "ip":
+            calls.append(args)
+            if args[1:6] == ["-j", "-d", "link", "show", "dev"]:
+                name = args[-1]
+                return subprocess.CompletedProcess(
+                    args, 0 if name in links else 1, "", "Cannot find device"
+                )
+            if args[1:3] == ["link", "add"]:
+                links.add(args[args.index("name") + 1])
+            elif args[1:3] == ["link", "delete"]:
+                links.discard(args[-1])
             return subprocess.CompletedProcess(args, 0)
         return original(args, **kwargs)
 
@@ -276,7 +289,7 @@ def test_structural_rollback_executes_lifecycle_before_desired_replacement(
     old_artifacts = artifacts(state)
     calls = []
 
-    def lifecycle(_self, plan):
+    def lifecycle(_self, plan, _model, _progress):
         calls.extend(plan.operations)
 
     monkeypatch.setattr(
